@@ -63,6 +63,21 @@ async function getEmbedding(text: string): Promise<number[]> {
   return d.data[0].embedding;
 }
 
+async function saveEmbedding(id: string, embedding: number[]): Promise<string | null> {
+  let lastError: string | null = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const { data, error } = await supabase
+      .from("thoughts")
+      .update({ embedding })
+      .eq("id", id)
+      .select("id")
+      .maybeSingle();
+    if (!error && data) return null;
+    lastError = error?.message ?? `Thought ${id} was not updated`;
+  }
+  return lastError;
+}
+
 async function extractMetadata(text: string): Promise<Record<string, unknown>> {
   const r = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
     method: "POST",
@@ -472,14 +487,10 @@ function buildServer(): McpServer {
         }
 
         const thoughtId = upsertResult?.id;
-        const { error: embError } = await supabase
-          .from("thoughts")
-          .update({ embedding })
-          .eq("id", thoughtId);
-
+        const embError = await saveEmbedding(thoughtId, embedding);
         if (embError) {
           return {
-            content: [{ type: "text" as const, text: `Failed to save embedding: ${embError.message}` }],
+            content: [{ type: "text" as const, text: `Failed to save embedding for thought ${thoughtId}: ${embError}` }],
             isError: true,
           };
         }
@@ -499,6 +510,48 @@ function buildServer(): McpServer {
       } catch (err: unknown) {
         return {
           content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    "repair_thought_embedding",
+    {
+      title: "Repair Thought Embedding",
+      description: "Fill a missing embedding on an existing thought by ID. Never creates or changes a thought.",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+      inputSchema: { id: z.string().uuid().describe("Existing thought ID") },
+    },
+    async ({ id }) => {
+      try {
+        const { data: thought, error } = await supabase
+          .from("thoughts")
+          .select("id, content, embedding")
+          .eq("id", id)
+          .maybeSingle();
+        if (error) throw new Error(`Failed to load thought ${id}: ${error.message}`);
+        if (!thought) throw new Error(`Thought ${id} not found`);
+        if (thought.embedding !== null) {
+          return { content: [{ type: "text" as const, text: `Thought ${id} already has an embedding; no change made.` }] };
+        }
+
+        const embedding = await getEmbedding(thought.content);
+        const saveError = await saveEmbedding(id, embedding);
+        if (saveError) throw new Error(`Failed to save embedding for thought ${id}: ${saveError}`);
+
+        const { data: verified, error: verifyError } = await supabase
+          .from("thoughts")
+          .select("id, embedding")
+          .eq("id", id)
+          .maybeSingle();
+        if (verifyError) throw new Error(`Failed to verify thought ${id}: ${verifyError.message}`);
+        if (!verified || verified.embedding === null) throw new Error(`Embedding remains NULL for thought ${id}`);
+        return { content: [{ type: "text" as const, text: `Repaired embedding for existing thought ${id}.` }] };
+      } catch (err: unknown) {
+        return {
+          content: [{ type: "text" as const, text: `Embedding repair failed for ${id}: ${(err as Error).message}` }],
           isError: true,
         };
       }
