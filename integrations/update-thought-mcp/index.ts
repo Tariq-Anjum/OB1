@@ -65,6 +65,34 @@ async function getEmbedding(text: string): Promise<number[]> {
   return d.data[0].embedding;
 }
 
+async function contentFingerprint(text: string): Promise<string> {
+  const normalized = text.toLowerCase().trim().replace(/\s+/g, " ");
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(normalized),
+  );
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0")
+  ).join("");
+}
+
+function mirrorSourcePath(content: string): string | null {
+  const match = /^\[my-ai-brain:([A-Za-z0-9._/-]+)\](?: |$)/.exec(content);
+  return match?.[1] ?? null;
+}
+
+function isExcludedMirror(metadata: Record<string, unknown> | null): boolean {
+  if (!metadata) return false;
+  return [
+    metadata.mirror_status,
+    metadata.lifecycle_status,
+    metadata.record_status,
+    metadata.status,
+  ].some((value) =>
+    value === "historical_superseded" || value === "accidental_duplicate"
+  );
+}
+
 // --- MCP Server Setup ---
 
 const server = new McpServer({
@@ -103,6 +131,37 @@ server.registerTool(
   },
   async ({ id, content, metadata_patch, if_unchanged_since }) => {
     try {
+      const sourcePath = content === undefined ? null : mirrorSourcePath(content);
+      if (content?.startsWith("[my-ai-brain:") && sourcePath === null) {
+        throw new Error("Invalid my-ai-brain source identity in content");
+      }
+      if (sourcePath !== null) {
+        const identity = `[my-ai-brain:${sourcePath}]`;
+        const { data: candidates, error: identityError } = await supabase
+          .from("thoughts")
+          .select("id, content, metadata")
+          .like("content", `${identity}%`)
+          .limit(1000);
+        if (identityError) {
+          throw new Error(`Failed to find source ${sourcePath}: ${identityError.message}`);
+        }
+        if ((candidates ?? []).length === 1000) {
+          throw new Error(`Too many rows to verify source identity ${sourcePath}`);
+        }
+        const matches = (candidates ?? []).filter((row) =>
+          typeof row.content === "string" && row.content.startsWith(identity)
+        );
+        if (matches.length !== 1) {
+          throw new Error(`Expected exactly one row for ${sourcePath}; found ${matches.length}`);
+        }
+        if (matches[0].id !== id) {
+          throw new Error(`Thought ID does not match source ${sourcePath}`);
+        }
+        if (isExcludedMirror(matches[0].metadata as Record<string, unknown> | null)) {
+          throw new Error(`Refusing to modify excluded mirror row for ${sourcePath}`);
+        }
+      }
+
       // Fetch existing row. We need updated_at for the concurrency check and
       // metadata for the shallow-merge.
       const { data: existing, error: fetchError } = await supabase
@@ -164,17 +223,28 @@ server.registerTool(
             isError: true,
           };
         }
-        const embedding = await getEmbedding(content);
+        const [embedding, fingerprint] = await Promise.all([
+          getEmbedding(content),
+          contentFingerprint(content),
+        ]);
         updates.content = content;
         updates.embedding = `[${embedding.join(",")}]`;
+        updates.content_fingerprint = fingerprint;
       }
 
-      if (metadata_patch !== undefined) {
+      if (metadata_patch !== undefined || sourcePath !== null) {
         const merged = {
           ...((existing.metadata as Record<string, unknown>) || {}),
-          ...metadata_patch,
+          ...(metadata_patch ?? {}),
         };
-        updates.metadata = merged;
+        updates.metadata = sourcePath === null
+          ? merged
+          : {
+            ...merged,
+            source: "my-ai-brain",
+            canonical_source_path: sourcePath,
+            mirror_status: "active",
+          };
       }
 
       if (Object.keys(updates).length === 0) {
