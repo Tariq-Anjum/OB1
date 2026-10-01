@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import * as identity from "./mirror_identity.mjs";
 
 import {
   buildAdoptionUpdate,
@@ -15,8 +16,11 @@ import {
 const sourcePath = "entries/projects/zhoor-reviewer-auth-containment.md";
 const otherPath = "entries/projects/other-entry.md";
 const expectedUpdatedAt = "2026-10-01T14:32:35.856751+00:00";
+const legacyFingerprint = "a".repeat(64);
 const legacyContent = "[projects] zhoor-reviewer-auth-containment (updated 2026-10-01): title\n\nbody";
 const marked = (path, tail = " source text") => `[my-ai-brain:${path}]${tail}`;
+const rendered = (path, body = "body", category = "projects") =>
+  `[my-ai-brain:${path}] title\nCategory: ${category} | Confidence: verified | Agent: controller | Updated: 2026-10-01\n\n${body}`;
 const validRow = (id = "row-1", path = sourcePath) => ({
   id,
   content: marked(path),
@@ -178,6 +182,53 @@ test("duplicate metadata claims are CONFLICT", () => {
   assert.equal(classifySourceRows(sourcePath, [row("one"), row("two")]).status, "CONFLICT");
 });
 
+test("lookup adapter includes malformed marker-only rows instead of returning NONE", async () => {
+  const malformed = {
+    id: "malformed-marker",
+    content: `[my-ai-brain:${sourcePath}`,
+    metadata: { source: "legacy" },
+    updated_at: expectedUpdatedAt,
+  };
+  const fakeSupabase = {
+    from(table) {
+      assert.equal(table, "thoughts");
+      return {
+        select() {
+          return {
+            like(column, pattern) {
+              assert.equal(column, "content");
+              return {
+                limit(limit) {
+                  assert.ok(limit > 0);
+                  const prefix = pattern.slice(0, -1);
+                  return Promise.resolve({
+                    data: [malformed].filter((row) => row.content.startsWith(prefix)),
+                    error: null,
+                  });
+                },
+              };
+            },
+            contains(column, filter) {
+              assert.equal(column, "metadata");
+              assert.deepEqual(filter, { canonical_source_path: sourcePath });
+              return {
+                limit(limit) {
+                  assert.ok(limit > 0);
+                  return Promise.resolve({ data: [], error: null });
+                },
+              };
+            },
+          };
+        },
+      };
+    },
+  };
+
+  assert.equal(typeof identity.lookupMirrorSourceRows, "function");
+  const resolution = await identity.lookupMirrorSourceRows(fakeSupabase, sourcePath, 1000);
+  assert.equal(resolution.status, "CONFLICT");
+});
+
 test("marker and metadata disagreement on one row is CONFLICT", () => {
   assert.equal(
     classifySourceRows(sourcePath, [
@@ -229,6 +280,7 @@ test("explicit adoption requires UUID, exact evidence, unique owner, and current
     expectedLegacyFingerprint: "legacy-fingerprint",
     legacyCandidateIds: ["target-uuid"],
     canonicalOwnerPaths: [sourcePath],
+    content: rendered(sourcePath),
   }), true);
 });
 
@@ -318,6 +370,101 @@ test("adoption rejects a second canonical owner for the legacy evidence", () => 
     legacyCandidateIds: ["target-uuid"],
     canonicalOwnerPaths: [sourcePath, otherPath],
   }), /exactly one canonical owner/i);
+});
+
+test("adoption rejects replacement content unrelated to the legacy row evidence", () => {
+  assert.throws(() => validateLegacyAdoption({
+    sourcePath,
+    sourceResolution: { status: "NONE" },
+    target: {
+      id: "target-uuid",
+      content: legacyContent,
+      content_fingerprint: "legacy-fingerprint",
+      metadata: {},
+      updated_at: expectedUpdatedAt,
+    },
+    explicitId: "target-uuid",
+    expectedUpdatedAt,
+    expectedLegacyContent: legacyContent,
+    expectedLegacyFingerprint: "legacy-fingerprint",
+    legacyCandidateIds: ["target-uuid"],
+    canonicalOwnerPaths: [sourcePath],
+    content: marked(sourcePath, " unrelated replacement body"),
+  }), /does not match legacy source evidence/);
+});
+
+test("guarded adoption rollback restores the same UUID and complete original row payload", () => {
+  const beforeImage = {
+    id: "target-uuid",
+    content: legacyContent,
+    embedding: "[0.1,0.2]",
+    content_fingerprint: legacyFingerprint,
+    metadata: { source: "mcp", type: "observation" },
+    created_at: "2026-10-01T10:00:00+00:00",
+    updated_at: expectedUpdatedAt,
+  };
+  const current = {
+    id: "target-uuid",
+    content: rendered(sourcePath),
+    embedding: "[0.3,0.4]",
+    content_fingerprint: "active-fingerprint",
+    metadata: { source: "my-ai-brain", canonical_source_path: sourcePath, mirror_status: "active" },
+    created_at: beforeImage.created_at,
+    updated_at: "2026-10-02T00:00:00+00:00",
+  };
+  assert.equal(typeof identity.buildAdoptionRestoration, "function");
+  const restoration = identity.buildAdoptionRestoration({
+    sourcePath,
+    current,
+    beforeImage,
+    explicitId: "target-uuid",
+    expectedUpdatedAt: current.updated_at,
+    sourceResolution: { status: "EXACT_ONE_VALID", row: current },
+  });
+  assert.equal(restoration.id, "target-uuid");
+  assert.equal(restoration.updates.content, legacyContent);
+  assert.equal(restoration.updates.embedding, "[0.1,0.2]");
+  assert.equal(restoration.updates.content_fingerprint, legacyFingerprint);
+  assert.deepEqual(restoration.updates.metadata, beforeImage.metadata);
+});
+
+test("guarded adoption rollback rejects a stale current-row revision", () => {
+  assert.equal(typeof identity.buildAdoptionRestoration, "function");
+  assert.throws(() => identity.buildAdoptionRestoration({
+    sourcePath,
+    current: validRow("target-uuid"),
+    beforeImage: { id: "target-uuid", content: legacyContent, embedding: "[0.1]", content_fingerprint: legacyFingerprint, metadata: {}, created_at: "2026-10-01T10:00:00+00:00" },
+    explicitId: "target-uuid",
+    expectedUpdatedAt: "2026-10-01T00:00:00+00:00",
+    sourceResolution: { status: "EXACT_ONE_VALID", row: validRow("target-uuid") },
+}), /stale/i);
+});
+
+test("guarded rollback rejects an incomplete or noncanonical database before-image", () => {
+  const current = {
+    id: "target-uuid",
+    content: rendered(sourcePath),
+    embedding: "[0.3,0.4]",
+    content_fingerprint: "active-fingerprint",
+    metadata: { source: "my-ai-brain", canonical_source_path: sourcePath, mirror_status: "active" },
+    created_at: "2026-10-01T10:00:00+00:00",
+    updated_at: "2026-10-02T00:00:00+00:00",
+  };
+  assert.throws(() => identity.buildAdoptionRestoration({
+    sourcePath,
+    current,
+    beforeImage: {
+      id: "target-uuid",
+      content: legacyContent,
+      embedding: [0.1, 0.2],
+      content_fingerprint: "not-a-sha256",
+      metadata: [],
+      created_at: current.created_at,
+    },
+    explicitId: "target-uuid",
+    expectedUpdatedAt: current.updated_at,
+    sourceResolution: { status: "EXACT_ONE_VALID", row: current },
+  }), /rollback image is missing/i);
 });
 
 test("invalid and noncanonical source paths are rejected", () => {

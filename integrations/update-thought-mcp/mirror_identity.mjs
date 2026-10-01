@@ -102,6 +102,48 @@ export function classifySourceRows(sourcePath, candidateRows) {
   return { status: "EXACT_ONE_VALID", row: claim.row };
 }
 
+export async function lookupMirrorSourceRows(supabase, sourcePath, maxRows) {
+  validateCanonicalSourcePath(sourcePath);
+  const markerPrefix = `[my-ai-brain:${sourcePath}`;
+  const [markerResult, metadataResult] = await Promise.all([
+    supabase.from("thoughts").select("id, content, metadata, created_at, updated_at, content_fingerprint")
+      .like("content", `${markerPrefix}%`).limit(maxRows),
+    supabase.from("thoughts").select("id, content, metadata, created_at, updated_at, content_fingerprint")
+      .contains("metadata", { canonical_source_path: sourcePath }).limit(maxRows),
+  ]);
+  if (markerResult.error) throw new Error(`source marker lookup failed: ${markerResult.error.message}`);
+  if (metadataResult.error) throw new Error(`source metadata lookup failed: ${metadataResult.error.message}`);
+  const markerRows = markerResult.data ?? [];
+  const metadataRows = metadataResult.data ?? [];
+  if (markerRows.length >= maxRows || metadataRows.length >= maxRows) {
+    throw new Error(`source lookup exceeded ${maxRows} rows; refusing to choose a mapping`);
+  }
+  return classifySourceRows(sourcePath, [...markerRows, ...metadataRows]);
+}
+
+export function validateAdoptionRenderAgreement(sourcePath, content, legacyContent) {
+  validateCanonicalSourcePath(sourcePath);
+  if (sourceMarkerPath(content) !== sourcePath) {
+    throw new Error("replacement content marker does not match canonical source path");
+  }
+  const contentSeparator = content.indexOf("\n\n");
+  const legacySeparator = legacyContent.indexOf("\n\n");
+  if (contentSeparator < 0 || legacySeparator < 0) {
+    throw new Error("replacement content does not match legacy source evidence");
+  }
+  const contentHeader = content.slice(0, contentSeparator).split("\n");
+  const legacyHeader = legacyContent.slice(0, legacySeparator);
+  const category = /^\[([^\]]+)\]\s/.exec(legacyHeader)?.[1];
+  const contentCategory = /^Category: ([^ |]+) \| Confidence: /.exec(contentHeader[1] ?? "")?.[1];
+  if (
+    contentCategory !== category ||
+    content.slice(contentSeparator + 2) !== legacyContent.slice(legacySeparator + 2)
+  ) {
+    throw new Error("replacement content does not match legacy source evidence");
+  }
+  return true;
+}
+
 export function buildAtomicMirrorInsert({
   sourcePath,
   content,
@@ -236,6 +278,7 @@ export function validateLegacyAdoption({
   expectedLegacyFingerprint,
   legacyCandidateIds,
   canonicalOwnerPaths,
+  content,
 }) {
   validateCanonicalSourcePath(sourcePath);
   if (sourceResolution?.status !== "NONE") {
@@ -275,6 +318,7 @@ export function validateLegacyAdoption({
   if (!Array.isArray(canonicalOwnerPaths) || canonicalOwnerPaths.length !== 1 || canonicalOwnerPaths[0] !== sourcePath) {
     throw new Error("expected exactly one canonical owner for legacy content");
   }
+  validateAdoptionRenderAgreement(sourcePath, content, expectedLegacyContent);
   return true;
 }
 
@@ -301,5 +345,73 @@ export function buildAdoptionUpdate({
     id: target.id,
     expectedUpdatedAt,
     updates: payload,
+  };
+}
+
+export function buildAdoptionRestoration({
+  sourcePath,
+  current,
+  beforeImage,
+  explicitId,
+  expectedUpdatedAt,
+  sourceResolution,
+}) {
+  validateCanonicalSourcePath(sourcePath);
+  if (!isRecord(current) || !isRecord(beforeImage) || current.id !== explicitId || beforeImage.id !== explicitId) {
+    throw new Error("rollback UUID does not match the explicit target");
+  }
+  if (typeof expectedUpdatedAt !== "string" || current.updated_at !== expectedUpdatedAt) {
+    throw new Error("STALE_READ: adopted thought changed before rollback");
+  }
+  if (current.created_at !== beforeImage.created_at) {
+    throw new Error("rollback image does not belong to the current thought");
+  }
+  if (sourceResolution?.status !== "EXACT_ONE_VALID" || sourceResolution.row?.id !== explicitId) {
+    throw new Error("current canonical mapping is not uniquely owned by the target");
+  }
+  const currentMetadata = isRecord(current.metadata) ? current.metadata : {};
+  if (
+    sourceMarkerPath(current.content) !== sourcePath ||
+    currentMetadata.source !== CANONICAL_SOURCE ||
+    currentMetadata.canonical_source_path !== sourcePath ||
+    currentMetadata.mirror_status !== "active"
+  ) {
+    throw new Error("current thought is not the active adoption being rolled back");
+  }
+
+  const beforeMetadata = isRecord(beforeImage.metadata) ? beforeImage.metadata : {};
+  let beforeMarker;
+  try {
+    beforeMarker = sourceMarkerPath(beforeImage.content);
+  } catch {
+    throw new Error("rollback image contains an invalid source marker");
+  }
+  if (
+    beforeMarker !== null ||
+    beforeMetadata.canonical_source_path !== undefined && beforeMetadata.canonical_source_path !== null ||
+    beforeMetadata.source === CANONICAL_SOURCE ||
+    isExcludedMirror(beforeMetadata)
+  ) {
+    throw new Error("rollback image is not a source-less active legacy row");
+  }
+  if (
+    typeof beforeImage.content !== "string" ||
+    typeof beforeImage.content_fingerprint !== "string" ||
+    !/^[a-f0-9]{64}$/.test(beforeImage.content_fingerprint) ||
+    beforeImage.metadata !== null && !isRecord(beforeImage.metadata) ||
+    !Object.hasOwn(beforeImage, "embedding") ||
+    typeof beforeImage.embedding !== "string"
+  ) {
+    throw new Error("rollback image is missing original content, embedding, or fingerprint");
+  }
+  return {
+    id: explicitId,
+    expectedUpdatedAt,
+    updates: {
+      content: beforeImage.content,
+      embedding: beforeImage.embedding,
+      content_fingerprint: beforeImage.content_fingerprint,
+      metadata: beforeImage.metadata ?? null,
+    },
   };
 }

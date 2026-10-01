@@ -38,8 +38,9 @@ import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 import {
   buildAdoptionUpdate,
+  buildAdoptionRestoration,
   buildAtomicMirrorInsert,
-  classifySourceRows,
+  lookupMirrorSourceRows,
   planMirrorSync,
   sourceMarkerPath,
   validateCanonicalSourcePath,
@@ -87,6 +88,7 @@ async function contentFingerprint(text: string): Promise<string> {
 
 const MIRROR_ROW_FIELDS =
   "id, content, metadata, created_at, updated_at, content_fingerprint";
+const MIRROR_ROLLBACK_FIELDS = `${MIRROR_ROW_FIELDS}, embedding`;
 const MAX_LOOKUP_ROWS = 1000;
 
 function toolError(message: string) {
@@ -101,27 +103,7 @@ function toolJson(value: Record<string, unknown>) {
 }
 
 async function lookupMirrorSource(sourcePath: string) {
-  validateCanonicalSourcePath(sourcePath);
-  const marker = `[my-ai-brain:${sourcePath}]`;
-  const [markerResult, metadataResult] = await Promise.all([
-    supabase.from("thoughts").select(MIRROR_ROW_FIELDS)
-      .like("content", `${marker}%`).limit(MAX_LOOKUP_ROWS),
-    supabase.from("thoughts").select(MIRROR_ROW_FIELDS)
-      .contains("metadata", { canonical_source_path: sourcePath })
-      .limit(MAX_LOOKUP_ROWS),
-  ]);
-  if (markerResult.error) {
-    throw new Error(`source marker lookup failed: ${markerResult.error.message}`);
-  }
-  if (metadataResult.error) {
-    throw new Error(`source metadata lookup failed: ${metadataResult.error.message}`);
-  }
-  const markerRows = markerResult.data ?? [];
-  const metadataRows = metadataResult.data ?? [];
-  if (markerRows.length >= MAX_LOOKUP_ROWS || metadataRows.length >= MAX_LOOKUP_ROWS) {
-    throw new Error(`source lookup exceeded ${MAX_LOOKUP_ROWS} rows; refusing to choose a mapping`);
-  }
-  return classifySourceRows(sourcePath, [...markerRows, ...metadataRows]);
+  return lookupMirrorSourceRows(supabase, sourcePath, MAX_LOOKUP_ROWS);
 }
 
 async function lookupLegacyCandidates(expectedLegacyContent: string) {
@@ -396,20 +378,66 @@ server.registerTool(
   "inspect_mirror_thought",
   {
     title: "Inspect Mirror Thought",
-    description: "Read one thought by UUID, including its current concurrency token, for an explicit source reconciliation.",
+    description: "Read one thought by UUID. Set include_rollback_image only before an explicit adoption to preserve the complete source-less row preimage, including its embedding.",
     inputSchema: {
       id: z.string().uuid().describe("UUID of the existing thought"),
+      include_rollback_image: z.boolean().optional(),
     },
   },
-  async ({ id }) => {
+  async ({ id, include_rollback_image }) => {
     try {
       const { data, error } = await supabase.from("thoughts")
-        .select(MIRROR_ROW_FIELDS).eq("id", id).maybeSingle();
+        .select(include_rollback_image ? MIRROR_ROLLBACK_FIELDS : MIRROR_ROW_FIELDS)
+        .eq("id", id).maybeSingle();
       if (error) return toolError(`inspect_mirror_thought failed: ${error.message}`);
       if (!data) return toolError(`Thought not found: ${id}`);
       return toolJson(data as Record<string, unknown>);
     } catch (err: unknown) {
       return toolError(`inspect_mirror_thought failed: ${(err as Error).message}`);
+    }
+  },
+);
+
+server.registerTool(
+  "restore_legacy_mirror_adoption",
+  {
+    title: "Restore Legacy Mirror Adoption",
+    description: "Restore a same-UUID pre-adoption row image only when the current row still uniquely maps to the requested canonical path and its updated_at matches the fresh expected revision.",
+    inputSchema: {
+      id: z.string().uuid(),
+      canonical_source_path: z.string().min(1).max(256),
+      expected_updated_at: z.string().datetime({ offset: true }),
+      before_image: z.record(z.string(), z.unknown()),
+    },
+  },
+  async ({ id, canonical_source_path, expected_updated_at, before_image }) => {
+    try {
+      validateCanonicalSourcePath(canonical_source_path);
+      const { data: current, error: currentError } = await supabase.from("thoughts")
+        .select(MIRROR_ROLLBACK_FIELDS).eq("id", id).maybeSingle();
+      if (currentError) throw new Error(`rollback target lookup failed: ${currentError.message}`);
+      if (!current) throw new Error(`Thought not found: ${id}`);
+      const sourceResolution = await lookupMirrorSource(canonical_source_path);
+      const restoration = buildAdoptionRestoration({
+        sourcePath: canonical_source_path,
+        current,
+        beforeImage: before_image,
+        explicitId: id,
+        expectedUpdatedAt: expected_updated_at,
+        sourceResolution,
+      });
+      const { data, error } = await supabase.from("thoughts")
+        .update(restoration.updates)
+        .eq("id", id)
+        .eq("updated_at", expected_updated_at)
+        .eq("created_at", before_image.created_at as string)
+        .select(MIRROR_ROW_FIELDS)
+        .maybeSingle();
+      if (error) throw new Error(`adoption rollback failed: ${error.message}`);
+      if (!data) throw new Error("STALE_READ: adopted thought changed during rollback");
+      return toolJson({ id: data.id, operation: "restored", canonical_source_path });
+    } catch (err: unknown) {
+      return toolError(`restore_legacy_mirror_adoption failed: ${(err as Error).message}`);
     }
   },
 );
@@ -556,6 +584,7 @@ server.registerTool(
         expectedLegacyFingerprint: legacy.fingerprint,
         legacyCandidateIds: legacy.rows.map((row) => row.id),
         canonicalOwnerPaths: canonical_owner_paths,
+        content,
       });
       if (legacy.fingerprint !== expected_legacy_fingerprint) {
         throw new Error("legacy fingerprint changed during adoption checks");

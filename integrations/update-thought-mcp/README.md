@@ -24,8 +24,10 @@ The integration also exposes three operations for the canonical Markdown
 memory mirror:
 
 - `inspect_mirror_thought(id)` reads one row and its current `updated_at` token.
+- `inspect_mirror_thought(id, include_rollback_image=true)` returns the full row preimage, including its embedding, for a one-time adoption rollback file.
 - `sync_mirror_thought(canonical_source_path, content, expected_legacy_content)` updates the one row whose leading marker and JSONB metadata agree, or inserts a new row with both identities in the same insert. It never adopts an unmarked legacy row automatically.
-- `adopt_legacy_mirror_thought(...)` is an explicit same-UUID update for a source-less row after checking the requested path, content/fingerprint evidence, unique canonical owner, and current timestamp. It never creates or deletes a thought.
+- `adopt_legacy_mirror_thought(...)` is an explicit same-UUID update for a source-less row after checking the requested path, content/fingerprint evidence, unique canonical owner, matching canonical/legacy render evidence, and current timestamp. It never creates or deletes a thought.
+- `restore_legacy_mirror_adoption(...)` restores a saved complete before-image to the same UUID only while the adopted mapping is still uniquely active and the supplied `updated_at` token is current.
 
 Active my-ai-brain rows carry both
 `[my-ai-brain:<canonical-relative-path>]` at the start of `content` and
@@ -53,7 +55,26 @@ Rollback for that index is:
 DROP INDEX IF EXISTS public.thoughts_canonical_source_path_uidx;
 ```
 
+Adoption is a privileged controller operation. Use the governed canonical
+my-ai-brain helper, which derives the source content and singleton owner set
+from the complete canonical entry inventory. The Edge Function independently
+checks that the new marked content and legacy evidence agree on category and
+body, that the exact target still matches the legacy fingerprint, and that
+both the source path and target revision remain unused/current. Do not use
+adoption as a general-purpose source reassignment action.
+
 The regression suite is `node --test integrations/update-thought-mcp/mirror_identity.test.mjs`.
+
+Before an adoption, call `inspect_mirror_thought` with
+`include_rollback_image=true` and save its complete response privately. The
+reviewed `ob1-mirror adopt` helper does this before mutation under
+`$XDG_STATE_HOME/my-ai-brain/ob1-adoption-rollback/` (defaulting to
+`~/.local/state/...`, directory mode `0700`, file mode `0600`). If adoption
+verification fails, use the helper's explicit `restore --id ... --path ...`
+action. It fetches a fresh current revision and asks
+`restore_legacy_mirror_adoption` to restore the original content, embedding,
+fingerprint, and metadata with a compare-and-swap update. Keep the before-image
+until the adopted row has passed readback verification.
 
 ## Prerequisites
 
@@ -100,6 +121,8 @@ supabase functions new update-thought-mcp
 ```bash
 curl -o supabase/functions/update-thought-mcp/index.ts \
   https://raw.githubusercontent.com/NateBJones-Projects/OB1/main/integrations/update-thought-mcp/index.ts
+curl -o supabase/functions/update-thought-mcp/mirror_identity.mjs \
+  https://raw.githubusercontent.com/NateBJones-Projects/OB1/main/integrations/update-thought-mcp/mirror_identity.mjs
 curl -o supabase/functions/update-thought-mcp/deno.json \
   https://raw.githubusercontent.com/NateBJones-Projects/OB1/main/integrations/update-thought-mcp/deno.json
 ```
@@ -145,7 +168,7 @@ To verify optimistic concurrency:
 ## Expected Outcome
 
 - A new Edge Function at `https://<project>.supabase.co/functions/v1/update-thought-mcp`.
-- A custom connector registered in your AI client that exposes `update_thought`, `inspect_mirror_thought`, `sync_mirror_thought`, and `adopt_legacy_mirror_thought`.
+- A custom connector registered in your AI client that exposes `update_thought`, `inspect_mirror_thought`, `sync_mirror_thought`, `adopt_legacy_mirror_thought`, and `restore_legacy_mirror_adoption`.
 - Updating an existing thought replaces its content, re-embeds it, or merges a metadata patch.
 - When `if_unchanged_since` is passed, the server rejects writes that would overwrite a concurrent change with a `STALE_READ` error, giving the caller a clear signal to re-fetch and retry.
 
