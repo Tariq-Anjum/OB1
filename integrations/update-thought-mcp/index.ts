@@ -40,6 +40,7 @@ import {
   buildAdoptionUpdate,
   buildAdoptionRestoration,
   buildAtomicMirrorInsert,
+  findApprovedLegacyAdoption,
   lookupMirrorSourceRows,
   planMirrorSync,
   sourceMarkerPath,
@@ -84,6 +85,11 @@ async function contentFingerprint(text: string): Promise<string> {
   return Array.from(new Uint8Array(digest), (byte) =>
     byte.toString(16).padStart(2, "0")
   ).join("");
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 const MIRROR_ROW_FIELDS =
@@ -532,7 +538,7 @@ server.registerTool(
   "adopt_legacy_mirror_thought",
   {
     title: "Adopt Proven Legacy Mirror Thought",
-    description: "Explicitly adopt one proven source-less legacy thought by UUID. Requires fresh content, fingerprint, source lookup, canonical owner, and updated_at evidence; never creates or deletes a row.",
+    description: "Adopt the one server-approved source-less legacy thought. Requires the exact canonical snapshot, owner inventory, content hashes, current source lookup, and updated_at evidence; never creates or deletes a row.",
     inputSchema: {
       id: z.string().uuid(),
       canonical_source_path: z.string().min(1).max(256),
@@ -541,6 +547,8 @@ server.registerTool(
       expected_legacy_content: z.string().min(1).max(50_000),
       expected_legacy_fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
       canonical_owner_paths: z.array(z.string().max(256)).max(20),
+      canonical_commit: z.string().regex(/^[a-f0-9]{40,64}$/),
+      canonical_inventory_sha256: z.string().regex(/^[a-f0-9]{64}$/),
     },
   },
   async ({
@@ -551,11 +559,27 @@ server.registerTool(
     expected_legacy_content,
     expected_legacy_fingerprint,
     canonical_owner_paths,
+    canonical_commit,
+    canonical_inventory_sha256,
   }) => {
     try {
       validateCanonicalSourcePath(canonical_source_path);
       if (sourceMarkerPath(content) !== canonical_source_path) {
         throw new Error("adoption content marker does not match canonical source path");
+      }
+      const approvedAdoption = findApprovedLegacyAdoption(id, canonical_source_path);
+      if (!approvedAdoption) {
+        throw new Error("no server-approved legacy adoption exists for this UUID and source path");
+      }
+      const [canonicalContentSha256, canonicalLegacySha256] = await Promise.all([
+        sha256Hex(content),
+        sha256Hex(expected_legacy_content),
+      ]);
+      if (canonical_commit !== approvedAdoption.canonicalCommit) {
+        throw new Error("canonical source commit does not match the server-approved adoption");
+      }
+      if (canonical_inventory_sha256 !== approvedAdoption.canonicalInventorySha256) {
+        throw new Error("canonical owner inventory does not match the server-approved adoption");
       }
       if (!OPENROUTER_API_KEY) {
         throw new Error("OPENROUTER_API_KEY is not set; adoption requires re-embedding");
@@ -584,6 +608,11 @@ server.registerTool(
         expectedLegacyFingerprint: legacy.fingerprint,
         legacyCandidateIds: legacy.rows.map((row) => row.id),
         canonicalOwnerPaths: canonical_owner_paths,
+        canonicalCommit: canonical_commit,
+        canonicalContentSha256,
+        canonicalLegacySha256,
+        canonicalInventorySha256: canonical_inventory_sha256,
+        approvedAdoption,
         content,
       });
       if (legacy.fingerprint !== expected_legacy_fingerprint) {

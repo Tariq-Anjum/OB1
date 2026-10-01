@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import * as identity from "./mirror_identity.mjs";
 
 import {
@@ -21,6 +22,16 @@ const legacyContent = "[projects] zhoor-reviewer-auth-containment (updated 2026-
 const marked = (path, tail = " source text") => `[my-ai-brain:${path}]${tail}`;
 const rendered = (path, body = "body", category = "projects") =>
   `[my-ai-brain:${path}] title\nCategory: ${category} | Confidence: verified | Agent: controller | Updated: 2026-10-01\n\n${body}`;
+const sha256 = (value) => createHash("sha256").update(value, "utf8").digest("hex");
+const testApproval = (path = sourcePath, id = "target-uuid") => ({
+  id,
+  sourcePath: path,
+  canonicalCommit: "a".repeat(40),
+  canonicalContentSha256: sha256(rendered(path)),
+  canonicalLegacySha256: sha256(legacyContent),
+  canonicalOwnerPaths: [path],
+  canonicalInventorySha256: "b".repeat(64),
+});
 const validRow = (id = "row-1", path = sourcePath) => ({
   id,
   content: marked(path),
@@ -263,6 +274,7 @@ test("source-less legacy candidates block normal create and are not adopted", ()
 });
 
 test("explicit adoption requires UUID, exact evidence, unique owner, and current revision", () => {
+  const approval = testApproval();
   const target = {
     id: "target-uuid",
     content: legacyContent,
@@ -280,8 +292,80 @@ test("explicit adoption requires UUID, exact evidence, unique owner, and current
     expectedLegacyFingerprint: "legacy-fingerprint",
     legacyCandidateIds: ["target-uuid"],
     canonicalOwnerPaths: [sourcePath],
+    canonicalCommit: approval.canonicalCommit,
+    canonicalContentSha256: approval.canonicalContentSha256,
+    canonicalLegacySha256: approval.canonicalLegacySha256,
+    canonicalInventorySha256: approval.canonicalInventorySha256,
     content: rendered(sourcePath),
+    approvedAdoption: approval,
   }), true);
+});
+
+test("adoption approval is server-selected and binds UUID, path, commit, content, and owner inventory", () => {
+  const approved = identity.findApprovedLegacyAdoption(
+    "b5b70849-80cd-4388-a3bc-b09ca8ded2a8",
+    sourcePath,
+  );
+  assert.ok(approved);
+  assert.equal(approved.canonicalCommit, "998c30ac8bfb7a95d64e1908c8509c8cbebcc1eb");
+  assert.equal(approved.canonicalContentSha256, "3c073f2e75c7f26250a29cb3c48e99a948e1f894fac5199f2627090e9be7a829");
+  assert.equal(approved.canonicalLegacySha256, "79dcc3bc6686cd0da5fde566509dfb21da6940918febd91a5c7bb34183e1b1b3");
+  assert.deepEqual(approved.canonicalOwnerPaths, [sourcePath]);
+  assert.equal(approved.canonicalInventorySha256, "ef121425d3ede84d220be464cc5e047946c3ee54eba23958dd1885daa385b30e");
+  assert.equal(identity.findApprovedLegacyAdoption("not-authorized", sourcePath), null);
+  assert.equal(identity.findApprovedLegacyAdoption("b5b70849-80cd-4388-a3bc-b09ca8ded2a8", otherPath), null);
+  const approval = testApproval();
+  const evidence = {
+    id: approval.id,
+    sourcePath: approval.sourcePath,
+    canonicalCommit: approval.canonicalCommit,
+    canonicalContentSha256: approval.canonicalContentSha256,
+    canonicalLegacySha256: approval.canonicalLegacySha256,
+    canonicalOwnerPaths: approval.canonicalOwnerPaths,
+    canonicalInventorySha256: approval.canonicalInventorySha256,
+  };
+  assert.equal(identity.validateLegacyAdoptionApproval(approval, evidence), true);
+  assert.throws(() => identity.validateLegacyAdoptionApproval(approval, {
+    ...evidence,
+    sourcePath: otherPath,
+  }), /server-approved legacy adoption/i);
+  assert.throws(() => identity.validateLegacyAdoptionApproval(approval, {
+    ...evidence,
+    canonicalCommit: "c".repeat(40),
+  }), /server-approved legacy adoption/i);
+  assert.throws(() => identity.validateLegacyAdoptionApproval(approval, {
+    ...evidence,
+    canonicalInventorySha256: "d".repeat(64),
+  }), /server-approved legacy adoption/i);
+  assert.throws(() => identity.validateLegacyAdoptionApproval(approval, {
+    ...evidence,
+    canonicalContentSha256: "e".repeat(64),
+  }), /server-approved legacy adoption/i);
+  assert.throws(() => identity.validateLegacyAdoptionApproval(approval, {
+    ...evidence,
+    canonicalOwnerPaths: [sourcePath, otherPath],
+  }), /server-approved legacy adoption/i);
+});
+
+test("adoption render agreement rejects missing or malformed category evidence", () => {
+  assert.throws(() => identity.validateAdoptionRenderAgreement(
+    otherPath,
+    `[my-ai-brain:${otherPath}] title\n\nbody`,
+    "ordinary thought\n\nbody",
+  ), /category/i);
+  assert.throws(() => identity.validateAdoptionRenderAgreement(
+    otherPath,
+    `[my-ai-brain:${otherPath}] title\nCategory: | Confidence: verified | Agent: controller | Updated: 2026-10-01\n\nbody`,
+    "[projects] title\n\nbody",
+  ), /category/i);
+});
+
+test("adoption render agreement rejects a category inconsistent with the source path", () => {
+  assert.throws(() => identity.validateAdoptionRenderAgreement(
+    sourcePath,
+    rendered(sourcePath, "body", "tools"),
+    "[tools] title\n\nbody",
+  ), /category.*source path/i);
 });
 
 test("adoption update preserves target UUID and establishes both identities", () => {

@@ -61,7 +61,12 @@ from the complete canonical entry inventory. The Edge Function independently
 checks that the new marked content and legacy evidence agree on category and
 body, that the exact target still matches the legacy fingerprint, and that
 both the source path and target revision remain unused/current. Do not use
-adoption as a general-purpose source reassignment action.
+adoption as a general-purpose source reassignment action. A legacy adoption
+must also match a server-side approval pinned to the target UUID, source path,
+canonical commit, content hashes, and complete inventory digest. This
+installation includes one such approval for the reviewed ZHOOR reviewer-auth
+row. Any other legacy adoption requires a separately reviewed Edge Function
+candidate; caller-supplied owner paths alone never authorize adoption.
 
 The regression suite is `node --test integrations/update-thought-mcp/mirror_identity.test.mjs`.
 

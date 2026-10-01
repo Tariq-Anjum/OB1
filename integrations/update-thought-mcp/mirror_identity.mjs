@@ -121,6 +121,47 @@ export async function lookupMirrorSourceRows(supabase, sourcePath, maxRows) {
   return classifySourceRows(sourcePath, [...markerRows, ...metadataRows]);
 }
 
+export const LEGACY_ADOPTION_APPROVALS = Object.freeze([
+  Object.freeze({
+    id: "b5b70849-80cd-4388-a3bc-b09ca8ded2a8",
+    sourcePath: "entries/projects/zhoor-reviewer-auth-containment.md",
+    canonicalCommit: "998c30ac8bfb7a95d64e1908c8509c8cbebcc1eb",
+    canonicalContentSha256: "3c073f2e75c7f26250a29cb3c48e99a948e1f894fac5199f2627090e9be7a829",
+    canonicalLegacySha256: "79dcc3bc6686cd0da5fde566509dfb21da6940918febd91a5c7bb34183e1b1b3",
+    canonicalOwnerPaths: Object.freeze(["entries/projects/zhoor-reviewer-auth-containment.md"]),
+    canonicalInventorySha256: "ef121425d3ede84d220be464cc5e047946c3ee54eba23958dd1885daa385b30e",
+  }),
+]);
+
+export function findApprovedLegacyAdoption(id, sourcePath, approvals = LEGACY_ADOPTION_APPROVALS) {
+  validateCanonicalSourcePath(sourcePath);
+  if (!Array.isArray(approvals)) return null;
+  return approvals.find((approval) =>
+    isRecord(approval) && approval.id === id && approval.sourcePath === sourcePath
+  ) ?? null;
+}
+
+export function validateLegacyAdoptionApproval(approval, evidence) {
+  if (!isRecord(approval) || !isRecord(evidence)) {
+    throw new Error("no server-approved legacy adoption evidence was supplied");
+  }
+  const ownerPathsMatch = Array.isArray(approval.canonicalOwnerPaths) &&
+    Array.isArray(evidence.canonicalOwnerPaths) &&
+    JSON.stringify(approval.canonicalOwnerPaths) === JSON.stringify(evidence.canonicalOwnerPaths);
+  if (
+    approval.id !== evidence.id ||
+    approval.sourcePath !== evidence.sourcePath ||
+    approval.canonicalCommit !== evidence.canonicalCommit ||
+    approval.canonicalContentSha256 !== evidence.canonicalContentSha256 ||
+    approval.canonicalLegacySha256 !== evidence.canonicalLegacySha256 ||
+    approval.canonicalInventorySha256 !== evidence.canonicalInventorySha256 ||
+    !ownerPathsMatch
+  ) {
+    throw new Error("canonical source evidence does not match the server-approved legacy adoption");
+  }
+  return true;
+}
+
 export function validateAdoptionRenderAgreement(sourcePath, content, legacyContent) {
   validateCanonicalSourcePath(sourcePath);
   if (sourceMarkerPath(content) !== sourcePath) {
@@ -128,18 +169,28 @@ export function validateAdoptionRenderAgreement(sourcePath, content, legacyConte
   }
   const contentSeparator = content.indexOf("\n\n");
   const legacySeparator = legacyContent.indexOf("\n\n");
-  if (contentSeparator < 0 || legacySeparator < 0) {
+  if (contentSeparator < 0) {
     throw new Error("replacement content does not match legacy source evidence");
   }
   const contentHeader = content.slice(0, contentSeparator).split("\n");
-  const legacyHeader = legacyContent.slice(0, legacySeparator);
-  const category = /^\[([^\]]+)\]\s/.exec(legacyHeader)?.[1];
-  const contentCategory = /^Category: ([^ |]+) \| Confidence: /.exec(contentHeader[1] ?? "")?.[1];
+  const legacyHeader = legacyContent.slice(0, legacySeparator < 0 ? legacyContent.length : legacySeparator);
+  const contentTitle = /^\[my-ai-brain:[^\]]+\] \S.*$/.test(contentHeader[0] ?? "");
+  const legacyMatch = /^\[([a-z0-9][a-z0-9-]*)\] \S.*$/.exec(legacyHeader.split("\n", 1)[0] ?? "");
+  const contentMatch = /^Category: ([a-z0-9][a-z0-9-]*) \| Confidence: \S+ \| Agent: \S+ \| Updated: \S+$/.exec(contentHeader[1] ?? "");
+  if (!contentTitle || contentHeader.length !== 2 || !legacyMatch || !contentMatch) {
+    throw new Error("replacement or legacy render is missing valid category evidence");
+  }
+  const legacyCategory = legacyMatch[1];
+  const contentCategory = contentMatch[1];
+  const sourceCategory = sourcePath.split("/")[1];
+  const legacyBody = legacySeparator < 0 ? "" : legacyContent.slice(legacySeparator + 2);
+  const contentBody = content.slice(contentSeparator + 2);
   if (
-    contentCategory !== category ||
-    content.slice(contentSeparator + 2) !== legacyContent.slice(legacySeparator + 2)
+    contentCategory !== legacyCategory ||
+    contentCategory !== sourceCategory ||
+    contentBody !== legacyBody
   ) {
-    throw new Error("replacement content does not match legacy source evidence");
+    throw new Error("replacement category or body does not match legacy source evidence and canonical source path");
   }
   return true;
 }
@@ -278,6 +329,11 @@ export function validateLegacyAdoption({
   expectedLegacyFingerprint,
   legacyCandidateIds,
   canonicalOwnerPaths,
+  canonicalCommit,
+  canonicalContentSha256,
+  canonicalLegacySha256,
+  canonicalInventorySha256,
+  approvedAdoption,
   content,
 }) {
   validateCanonicalSourcePath(sourcePath);
@@ -319,6 +375,15 @@ export function validateLegacyAdoption({
     throw new Error("expected exactly one canonical owner for legacy content");
   }
   validateAdoptionRenderAgreement(sourcePath, content, expectedLegacyContent);
+  validateLegacyAdoptionApproval(approvedAdoption, {
+    id: explicitId,
+    sourcePath,
+    canonicalCommit,
+    canonicalContentSha256,
+    canonicalLegacySha256,
+    canonicalOwnerPaths,
+    canonicalInventorySha256,
+  });
   return true;
 }
 
