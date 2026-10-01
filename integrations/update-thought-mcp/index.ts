@@ -1,6 +1,6 @@
 /**
- * update-thought-mcp — Standalone MCP Edge Function that adds a single tool:
- *   update_thought(id, content?, metadata_patch?, if_unchanged_since?)
+ * update-thought-mcp — Standalone MCP Edge Function with generic thought
+ * updates and source-aware my-ai-brain mirror operations.
  *
  * Why a separate Edge Function?
  *   The core `open-brain` MCP server (server/index.ts) is curated and does not
@@ -25,7 +25,7 @@
  * Env vars:
  *   SUPABASE_URL
  *   SUPABASE_SERVICE_ROLE_KEY
- *   OPENROUTER_API_KEY        — only used when `content` is provided
+ *   OPENROUTER_API_KEY        — used when content needs embedding
  *   MCP_ACCESS_KEY
  */
 
@@ -36,6 +36,15 @@ import { StreamableHTTPTransport } from "@hono/mcp";
 import { Hono } from "hono";
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
+import {
+  buildAdoptionUpdate,
+  buildAtomicMirrorInsert,
+  classifySourceRows,
+  planMirrorSync,
+  sourceMarkerPath,
+  validateCanonicalSourcePath,
+  validateLegacyAdoption,
+} from "./mirror_identity.mjs";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -76,28 +85,85 @@ async function contentFingerprint(text: string): Promise<string> {
   ).join("");
 }
 
-function mirrorSourcePath(content: string): string | null {
-  const match = /^\[my-ai-brain:([A-Za-z0-9._/-]+)\](?: |$)/.exec(content);
-  return match?.[1] ?? null;
+const MIRROR_ROW_FIELDS =
+  "id, content, metadata, created_at, updated_at, content_fingerprint";
+const MAX_LOOKUP_ROWS = 1000;
+
+function toolError(message: string) {
+  return {
+    content: [{ type: "text" as const, text: message }],
+    isError: true,
+  };
 }
 
-function isExcludedMirror(metadata: Record<string, unknown> | null): boolean {
-  if (!metadata) return false;
-  return [
-    metadata.mirror_status,
-    metadata.lifecycle_status,
-    metadata.record_status,
-    metadata.status,
-  ].some((value) =>
-    value === "historical_superseded" || value === "accidental_duplicate"
-  );
+function toolJson(value: Record<string, unknown>) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(value) }] };
+}
+
+async function lookupMirrorSource(sourcePath: string) {
+  validateCanonicalSourcePath(sourcePath);
+  const marker = `[my-ai-brain:${sourcePath}]`;
+  const [markerResult, metadataResult] = await Promise.all([
+    supabase.from("thoughts").select(MIRROR_ROW_FIELDS)
+      .like("content", `${marker}%`).limit(MAX_LOOKUP_ROWS),
+    supabase.from("thoughts").select(MIRROR_ROW_FIELDS)
+      .contains("metadata", { canonical_source_path: sourcePath })
+      .limit(MAX_LOOKUP_ROWS),
+  ]);
+  if (markerResult.error) {
+    throw new Error(`source marker lookup failed: ${markerResult.error.message}`);
+  }
+  if (metadataResult.error) {
+    throw new Error(`source metadata lookup failed: ${metadataResult.error.message}`);
+  }
+  const markerRows = markerResult.data ?? [];
+  const metadataRows = metadataResult.data ?? [];
+  if (markerRows.length >= MAX_LOOKUP_ROWS || metadataRows.length >= MAX_LOOKUP_ROWS) {
+    throw new Error(`source lookup exceeded ${MAX_LOOKUP_ROWS} rows; refusing to choose a mapping`);
+  }
+  return classifySourceRows(sourcePath, [...markerRows, ...metadataRows]);
+}
+
+async function lookupLegacyCandidates(expectedLegacyContent: string) {
+  const fingerprint = await contentFingerprint(expectedLegacyContent);
+  const [fingerprintResult, contentResult] = await Promise.all([
+    supabase.from("thoughts").select(MIRROR_ROW_FIELDS)
+      .eq("content_fingerprint", fingerprint).limit(MAX_LOOKUP_ROWS),
+    supabase.from("thoughts").select(MIRROR_ROW_FIELDS)
+      .eq("content", expectedLegacyContent).limit(MAX_LOOKUP_ROWS),
+  ]);
+  if (fingerprintResult.error) {
+    throw new Error(`legacy fingerprint lookup failed: ${fingerprintResult.error.message}`);
+  }
+  if (contentResult.error) {
+    throw new Error(`legacy content lookup failed: ${contentResult.error.message}`);
+  }
+  const fingerprintRows = fingerprintResult.data ?? [];
+  const contentRows = contentResult.data ?? [];
+  if (fingerprintRows.length >= MAX_LOOKUP_ROWS || contentRows.length >= MAX_LOOKUP_ROWS) {
+    throw new Error("legacy candidate lookup exceeded its bound; refusing to create or adopt");
+  }
+  const rowsById = new Map<string, (typeof fingerprintRows)[number]>();
+  for (const row of [...fingerprintRows, ...contentRows]) {
+    const previous = rowsById.get(row.id);
+    if (previous && (
+      previous.content !== row.content ||
+      previous.updated_at !== row.updated_at ||
+      previous.content_fingerprint !== row.content_fingerprint ||
+      JSON.stringify(previous.metadata ?? null) !== JSON.stringify(row.metadata ?? null)
+    )) {
+      throw new Error("legacy candidate changed during lookup; retry after a fresh read");
+    }
+    rowsById.set(row.id, row);
+  }
+  return { fingerprint, rows: [...rowsById.values()] };
 }
 
 // --- MCP Server Setup ---
 
 const server = new McpServer({
   name: "open-brain-update-thought",
-  version: "1.0.0",
+  version: "1.1.0",
 });
 
 server.registerTool(
@@ -131,42 +197,11 @@ server.registerTool(
   },
   async ({ id, content, metadata_patch, if_unchanged_since }) => {
     try {
-      const sourcePath = content === undefined ? null : mirrorSourcePath(content);
-      if (content?.startsWith("[my-ai-brain:") && sourcePath === null) {
-        throw new Error("Invalid my-ai-brain source identity in content");
-      }
-      if (sourcePath !== null) {
-        const identity = `[my-ai-brain:${sourcePath}]`;
-        const { data: candidates, error: identityError } = await supabase
-          .from("thoughts")
-          .select("id, content, metadata")
-          .like("content", `${identity}%`)
-          .limit(1000);
-        if (identityError) {
-          throw new Error(`Failed to find source ${sourcePath}: ${identityError.message}`);
-        }
-        if ((candidates ?? []).length === 1000) {
-          throw new Error(`Too many rows to verify source identity ${sourcePath}`);
-        }
-        const matches = (candidates ?? []).filter((row) =>
-          typeof row.content === "string" && row.content.startsWith(identity)
-        );
-        if (matches.length !== 1) {
-          throw new Error(`Expected exactly one row for ${sourcePath}; found ${matches.length}`);
-        }
-        if (matches[0].id !== id) {
-          throw new Error(`Thought ID does not match source ${sourcePath}`);
-        }
-        if (isExcludedMirror(matches[0].metadata as Record<string, unknown> | null)) {
-          throw new Error(`Refusing to modify excluded mirror row for ${sourcePath}`);
-        }
-      }
-
       // Fetch existing row. We need updated_at for the concurrency check and
       // metadata for the shallow-merge.
       const { data: existing, error: fetchError } = await supabase
         .from("thoughts")
-        .select("id, content, metadata, created_at, updated_at")
+        .select(MIRROR_ROW_FIELDS)
         .eq("id", id)
         .single();
 
@@ -180,6 +215,62 @@ server.registerTool(
           ],
           isError: true,
         };
+      }
+
+      let sourcePath: string | null = null;
+      if (content !== undefined) {
+        try {
+          sourcePath = sourceMarkerPath(content);
+        } catch {
+          throw new Error("Invalid my-ai-brain source identity in content");
+        }
+      }
+      const existingMetadata =
+        (existing.metadata as Record<string, unknown> | null) ?? {};
+      let existingMarkerPath: string | null = null;
+      try {
+        existingMarkerPath = sourceMarkerPath(existing.content as string);
+      } catch {
+        throw new Error("Existing thought has an invalid source identity marker");
+      }
+      const existingMetadataPath = existingMetadata.canonical_source_path;
+      const existingClaimsIdentity =
+        existingMarkerPath !== null ||
+        existingMetadataPath !== undefined && existingMetadataPath !== null ||
+        existingMetadata.source === "my-ai-brain";
+
+      if (existingClaimsIdentity) {
+        if (
+          typeof existingMetadataPath !== "string" ||
+          existingMarkerPath !== existingMetadataPath ||
+          existingMetadata.source !== "my-ai-brain"
+        ) {
+          throw new Error("Existing thought has conflicting my-ai-brain source identity");
+        }
+        const existingResolution = await lookupMirrorSource(existingMetadataPath);
+        if (
+          existingResolution.status !== "EXACT_ONE_VALID" ||
+          existingResolution.row.id !== id
+        ) {
+          throw new Error(`Existing source mapping is ${existingResolution.status}; refusing generic update`);
+        }
+        if (content !== undefined && sourcePath !== existingMetadataPath) {
+          throw new Error("Mapped my-ai-brain content must retain its canonical source marker");
+        }
+      } else if (sourcePath !== null) {
+        const resolution = await lookupMirrorSource(sourcePath);
+        if (resolution.status !== "EXACT_ONE_VALID" || resolution.row.id !== id) {
+          throw new Error(`Source mapping is ${resolution.status} or points to another UUID; generic update refused`);
+        }
+      }
+
+      const protectedIdentityKeys = ["canonical_source_path", "source", "mirror_status"];
+      if (metadata_patch && protectedIdentityKeys.some((key) => key in metadata_patch)) {
+        if (existingClaimsIdentity ||
+          metadata_patch.source === "my-ai-brain" ||
+          (metadata_patch.canonical_source_path !== undefined && metadata_patch.canonical_source_path !== null)) {
+          throw new Error("my-ai-brain identity fields are managed by source-aware mirror operations");
+        }
       }
 
       // Optimistic concurrency check. Reject if stored updated_at is strictly
@@ -234,17 +325,10 @@ server.registerTool(
 
       if (metadata_patch !== undefined || sourcePath !== null) {
         const merged = {
-          ...((existing.metadata as Record<string, unknown>) || {}),
+          ...existingMetadata,
           ...(metadata_patch ?? {}),
         };
-        updates.metadata = sourcePath === null
-          ? merged
-          : {
-            ...merged,
-            source: "my-ai-brain",
-            canonical_source_path: sourcePath,
-            mirror_status: "active",
-          };
+        updates.metadata = merged;
       }
 
       if (Object.keys(updates).length === 0) {
@@ -258,12 +342,19 @@ server.registerTool(
         };
       }
 
-      const { data, error } = await supabase
+      let updateQuery = supabase
         .from("thoughts")
         .update(updates)
-        .eq("id", id)
+        .eq("id", id);
+      if (existingClaimsIdentity || sourcePath !== null) {
+        if (typeof existing.updated_at !== "string" || !existing.updated_at) {
+          throw new Error("Mapped source row has no updated_at concurrency token");
+        }
+        updateQuery = updateQuery.eq("updated_at", existing.updated_at);
+      }
+      const { data, error } = await updateQuery
         .select("id, content, metadata, created_at, updated_at")
-        .single();
+        .maybeSingle();
 
       if (error) {
         return {
@@ -275,6 +366,9 @@ server.registerTool(
           ],
           isError: true,
         };
+      }
+      if (!data) {
+        return toolError("STALE_READ: thought changed during update; re-fetch and retry.");
       }
 
       const parts = [
@@ -294,6 +388,215 @@ server.registerTool(
         ],
         isError: true,
       };
+    }
+  },
+);
+
+server.registerTool(
+  "inspect_mirror_thought",
+  {
+    title: "Inspect Mirror Thought",
+    description: "Read one thought by UUID, including its current concurrency token, for an explicit source reconciliation.",
+    inputSchema: {
+      id: z.string().uuid().describe("UUID of the existing thought"),
+    },
+  },
+  async ({ id }) => {
+    try {
+      const { data, error } = await supabase.from("thoughts")
+        .select(MIRROR_ROW_FIELDS).eq("id", id).maybeSingle();
+      if (error) return toolError(`inspect_mirror_thought failed: ${error.message}`);
+      if (!data) return toolError(`Thought not found: ${id}`);
+      return toolJson(data as Record<string, unknown>);
+    } catch (err: unknown) {
+      return toolError(`inspect_mirror_thought failed: ${(err as Error).message}`);
+    }
+  },
+);
+
+server.registerTool(
+  "sync_mirror_thought",
+  {
+    title: "Sync Canonical Mirror Thought",
+    description: "Create or update one my-ai-brain mirror by canonical relative source path. Creates include marker and metadata identity in the initial row insert; ambiguous legacy matches fail closed.",
+    inputSchema: {
+      canonical_source_path: z.string().min(1).max(256),
+      content: z.string().min(1).max(50_000),
+      expected_legacy_content: z.string().min(1).max(50_000),
+    },
+  },
+  async ({ canonical_source_path, content, expected_legacy_content }) => {
+    try {
+      validateCanonicalSourcePath(canonical_source_path);
+      if (sourceMarkerPath(content) !== canonical_source_path) {
+        throw new Error("content marker does not match canonical_source_path");
+      }
+      if (!OPENROUTER_API_KEY) {
+        throw new Error("OPENROUTER_API_KEY is not set; source mirror writes require embeddings");
+      }
+
+      const [resolution, legacy] = await Promise.all([
+        lookupMirrorSource(canonical_source_path),
+        lookupLegacyCandidates(expected_legacy_content),
+      ]);
+      const plan = planMirrorSync({
+        sourcePath: canonical_source_path,
+        content,
+        resolution,
+        legacyCandidates: legacy.rows,
+      });
+      if (plan.kind === "blocked") {
+        throw new Error(`${plan.reason}: no row was changed`);
+      }
+
+      const [embedding, fingerprint] = await Promise.all([
+        getEmbedding(content),
+        contentFingerprint(content),
+      ]);
+      const metadata = plan.kind === "update"
+        ? plan.row.metadata
+        : { type: "observation", topics: [], people: [], action_items: [] };
+      const payload = buildAtomicMirrorInsert({
+        sourcePath: canonical_source_path,
+        content,
+        embedding,
+        fingerprint,
+        metadata: (metadata as Record<string, unknown> | null) ?? {},
+      });
+
+      if (plan.kind === "update") {
+        if (typeof plan.expectedUpdatedAt !== "string" || !plan.expectedUpdatedAt) {
+          throw new Error("mapped row has no updated_at concurrency token");
+        }
+        const { data, error } = await supabase.from("thoughts")
+          .update(payload)
+          .eq("id", plan.id)
+          .eq("updated_at", plan.expectedUpdatedAt)
+          .select(MIRROR_ROW_FIELDS)
+          .maybeSingle();
+        if (error) throw new Error(`source-aware update failed: ${error.message}`);
+        if (!data) throw new Error("STALE_READ: mapped mirror changed during update");
+        return toolJson({ id: data.id, operation: "updated", canonical_source_path });
+      }
+
+      const { data, error } = await supabase.from("thoughts")
+        .insert(payload)
+        .select(MIRROR_ROW_FIELDS)
+        .single();
+      if (error) {
+        if (error.code === "23505") {
+          const current = await lookupMirrorSource(canonical_source_path);
+          if (current.status === "EXACT_ONE_VALID") {
+            throw new Error(`CONCURRENT_MAPPING: ${canonical_source_path} now maps to ${current.row.id}; no retry or update was attempted`);
+          }
+          throw new Error(`UNIQUE_INSERT_CONFLICT: ${canonical_source_path} lookup is ${current.status}; no retry or update was attempted`);
+        }
+        throw new Error(`source-aware insert failed: ${error.message}`);
+      }
+      return toolJson({ id: data.id, operation: "created", canonical_source_path });
+    } catch (err: unknown) {
+      return toolError(`sync_mirror_thought failed: ${(err as Error).message}`);
+    }
+  },
+);
+
+server.registerTool(
+  "adopt_legacy_mirror_thought",
+  {
+    title: "Adopt Proven Legacy Mirror Thought",
+    description: "Explicitly adopt one proven source-less legacy thought by UUID. Requires fresh content, fingerprint, source lookup, canonical owner, and updated_at evidence; never creates or deletes a row.",
+    inputSchema: {
+      id: z.string().uuid(),
+      canonical_source_path: z.string().min(1).max(256),
+      content: z.string().min(1).max(50_000),
+      expected_updated_at: z.string().datetime({ offset: true }),
+      expected_legacy_content: z.string().min(1).max(50_000),
+      expected_legacy_fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+      canonical_owner_paths: z.array(z.string().max(256)).max(20),
+    },
+  },
+  async ({
+    id,
+    canonical_source_path,
+    content,
+    expected_updated_at,
+    expected_legacy_content,
+    expected_legacy_fingerprint,
+    canonical_owner_paths,
+  }) => {
+    try {
+      validateCanonicalSourcePath(canonical_source_path);
+      if (sourceMarkerPath(content) !== canonical_source_path) {
+        throw new Error("adoption content marker does not match canonical source path");
+      }
+      if (!OPENROUTER_API_KEY) {
+        throw new Error("OPENROUTER_API_KEY is not set; adoption requires re-embedding");
+      }
+      const computedLegacyFingerprint = await contentFingerprint(expected_legacy_content);
+      if (computedLegacyFingerprint !== expected_legacy_fingerprint) {
+        throw new Error("expected legacy fingerprint does not match canonical evidence");
+      }
+
+      const { data: target, error: targetError } = await supabase.from("thoughts")
+        .select(MIRROR_ROW_FIELDS).eq("id", id).maybeSingle();
+      if (targetError) throw new Error(`target lookup failed: ${targetError.message}`);
+      if (!target) throw new Error(`Thought not found: ${id}`);
+
+      const [sourceResolution, legacy] = await Promise.all([
+        lookupMirrorSource(canonical_source_path),
+        lookupLegacyCandidates(expected_legacy_content),
+      ]);
+      validateLegacyAdoption({
+        sourcePath: canonical_source_path,
+        sourceResolution,
+        target,
+        explicitId: id,
+        expectedUpdatedAt: expected_updated_at,
+        expectedLegacyContent: expected_legacy_content,
+        expectedLegacyFingerprint: legacy.fingerprint,
+        legacyCandidateIds: legacy.rows.map((row) => row.id),
+        canonicalOwnerPaths: canonical_owner_paths,
+      });
+      if (legacy.fingerprint !== expected_legacy_fingerprint) {
+        throw new Error("legacy fingerprint changed during adoption checks");
+      }
+
+      const [embedding, fingerprint] = await Promise.all([
+        getEmbedding(content),
+        contentFingerprint(content),
+      ]);
+      const adoption = buildAdoptionUpdate({
+        sourcePath: canonical_source_path,
+        target,
+        expectedUpdatedAt: expected_updated_at,
+        content,
+        embedding,
+        fingerprint,
+      });
+      const { data, error } = await supabase.from("thoughts")
+        .update(adoption.updates)
+        .eq("id", id)
+        .eq("updated_at", expected_updated_at)
+        .eq("content", expected_legacy_content)
+        .eq("content_fingerprint", expected_legacy_fingerprint)
+        .select(MIRROR_ROW_FIELDS)
+        .maybeSingle();
+      if (error) {
+        if (error.code === "23505") {
+          const current = await lookupMirrorSource(canonical_source_path);
+          throw new Error(`CONCURRENT_MAPPING: adoption lost a uniqueness race; current lookup is ${current.status}`);
+        }
+        throw new Error(`legacy adoption update failed: ${error.message}`);
+      }
+      if (!data) throw new Error("STALE_READ: legacy thought changed during adoption");
+      return toolJson({
+        id: data.id,
+        operation: "adopted",
+        canonical_source_path,
+        updated_at: data.updated_at,
+      });
+    } catch (err: unknown) {
+      return toolError(`adopt_legacy_mirror_thought failed: ${(err as Error).message}`);
     }
   },
 );

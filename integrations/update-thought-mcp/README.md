@@ -8,7 +8,7 @@
 
 ## What It Does
 
-The core Open Brain MCP server captures, searches, lists, and summarises thoughts but does not expose an update path. This integration adds a single new tool, `update_thought`, deployable as a separate Supabase Edge Function and registered as its own custom connector alongside your main Open Brain connector.
+The core Open Brain MCP server captures, searches, lists, and summarises thoughts but does not expose an update path. This integration adds `update_thought` plus narrowly scoped source-aware operations for canonical my-ai-brain mirrors. Deploy it as a separate Supabase Edge Function and register it as its own custom connector alongside your main Open Brain connector.
 
 The tool supports three arguments:
 
@@ -17,6 +17,43 @@ The tool supports three arguments:
 - `if_unchanged_since` — optional ISO 8601 timestamp. When supplied, the update is rejected with `STALE_READ` if the stored `updated_at` has advanced past that reference. Omit for last-write-wins behaviour (backward compatible).
 
 Why it matters: once more than one agent writes to the same Open Brain (Claude Desktop, Codex, a background worker, etc.), last-write-wins silently drops concurrent edits. Optimistic concurrency is the cheapest fix — pass the `updated_at` you read, and the server rejects the write if something changed in between.
+
+### Canonical my-ai-brain mirror operations
+
+The integration also exposes three operations for the canonical Markdown
+memory mirror:
+
+- `inspect_mirror_thought(id)` reads one row and its current `updated_at` token.
+- `sync_mirror_thought(canonical_source_path, content, expected_legacy_content)` updates the one row whose leading marker and JSONB metadata agree, or inserts a new row with both identities in the same insert. It never adopts an unmarked legacy row automatically.
+- `adopt_legacy_mirror_thought(...)` is an explicit same-UUID update for a source-less row after checking the requested path, content/fingerprint evidence, unique canonical owner, and current timestamp. It never creates or deletes a thought.
+
+Active my-ai-brain rows carry both
+`[my-ai-brain:<canonical-relative-path>]` at the start of `content` and
+`metadata.source = "my-ai-brain"`,
+`metadata.canonical_source_path = "<canonical-relative-path>"`, and
+`metadata.mirror_status = "active"`. Marker and metadata must agree. Ambiguity
+fails closed.
+
+The partial unique index in
+[`supabase/migrations/20261002000000_thoughts_canonical_source_path_unique.sql`](../../supabase/migrations/20261002000000_thoughts_canonical_source_path_unique.sql)
+enforces one non-null canonical path per row set. Before applying it, check
+that there are no duplicate non-null paths:
+
+```sql
+SELECT metadata->>'canonical_source_path' AS source_path, count(*)
+FROM public.thoughts
+WHERE metadata->>'canonical_source_path' IS NOT NULL
+GROUP BY 1
+HAVING count(*) > 1;
+```
+
+Rollback for that index is:
+
+```sql
+DROP INDEX IF EXISTS public.thoughts_canonical_source_path_uidx;
+```
+
+The regression suite is `node --test integrations/update-thought-mcp/mirror_identity.test.mjs`.
 
 ## Prerequisites
 
@@ -108,7 +145,7 @@ To verify optimistic concurrency:
 ## Expected Outcome
 
 - A new Edge Function at `https://<project>.supabase.co/functions/v1/update-thought-mcp`.
-- A custom connector registered in your AI client that exposes exactly one tool, `update_thought`.
+- A custom connector registered in your AI client that exposes `update_thought`, `inspect_mirror_thought`, `sync_mirror_thought`, and `adopt_legacy_mirror_thought`.
 - Updating an existing thought replaces its content, re-embeds it, or merges a metadata patch.
 - When `if_unchanged_since` is passed, the server rejects writes that would overwrite a concurrent change with a `STALE_READ` error, giving the caller a clear signal to re-fetch and retry.
 
