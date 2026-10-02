@@ -4,7 +4,7 @@
 
 **Created by [@txcfi-scott](https://github.com/txcfi-scott)**
 
-> Standalone MCP Edge Function that adds an `update_thought` tool with optional `if_unchanged_since` optimistic concurrency for multi-writer setups.
+> Standalone MCP Edge Function that adds an `update_thought` tool with mandatory internal compare-and-swap and an optional caller `if_unchanged_since` check.
 
 ## What It Does
 
@@ -14,15 +14,16 @@ The tool supports three arguments:
 
 - `content` — when provided, overwrites the thought's text and regenerates its embedding via OpenRouter.
 - `metadata_patch` — shallow-merged into the existing `metadata` JSONB. Keys not present in the patch are left alone.
-- `if_unchanged_since` — optional ISO 8601 timestamp. When supplied, the update is rejected with `STALE_READ` if the stored `updated_at` has advanced past that reference. Omit for last-write-wins behaviour (backward compatible).
+- `if_unchanged_since` — optional ISO 8601 timestamp. When supplied, the update is rejected with `STALE_READ` if the stored `updated_at` has advanced past that reference. Every update also compares against the revision fetched by the handler, even when this argument is omitted.
 
-Why it matters: once more than one agent writes to the same Open Brain (Claude Desktop, Codex, a background worker, etc.), last-write-wins silently drops concurrent edits. Optimistic concurrency is the cheapest fix — pass the `updated_at` you read, and the server rejects the write if something changed in between.
+Why it matters: once more than one agent writes to the same Open Brain (Claude Desktop, Codex, a background worker, etc.), last-write-wins silently drops concurrent edits. The handler always rejects changes made after its initial read. Pass the `updated_at` you read to additionally reject changes made before the handler begins.
 
 ### Canonical my-ai-brain mirror operations
 
-The integration also exposes three operations for the canonical Markdown
+The integration also exposes operations for the canonical Markdown
 memory mirror:
 
+- `lookup_mirror_source(canonical_source_path)` reads both marker and metadata claims and returns their existing fail-closed classification without writing.
 - `inspect_mirror_thought(id)` reads one row and its current `updated_at` token.
 - `inspect_mirror_thought(id, include_rollback_image=true)` returns the full row preimage, including its embedding, for a one-time adoption rollback file.
 - `sync_mirror_thought(canonical_source_path, content, expected_legacy_content)` updates the one row whose leading marker and JSONB metadata agree, or inserts a new row with both identities in the same insert. It never adopts an unmarked legacy row automatically.
@@ -68,14 +69,13 @@ installation includes one such approval for the reviewed ZHOOR reviewer-auth
 row. Any other legacy adoption requires a separately reviewed Edge Function
 candidate; caller-supplied owner paths alone never authorize adoption.
 
-The regression suite is `node --test integrations/update-thought-mcp/mirror_identity.test.mjs`.
+The regression suite is `node --test integrations/update-thought-mcp/handler.test.mjs integrations/update-thought-mcp/mirror_identity.test.mjs`.
 
 Before an adoption, call `inspect_mirror_thought` with
 `include_rollback_image=true` and save its complete response privately. The
 reviewed `ob1-mirror adopt` helper does this before mutation under
 `$XDG_STATE_HOME/my-ai-brain/ob1-adoption-rollback/` (defaulting to
-`~/.local/state/...`, directory mode `0700`, file mode `0600`). If adoption
-verification fails, use the helper's explicit `restore --id ... --path ...`
+`~/.local/state/...`, directory mode `0700`, file mode `0600`). The helper independently verifies the adopted UUID, marker, protected metadata, and unique source mapping before releasing the canonical lock. Failed readback retains the preimage and a private diagnostic and does not retry or restore automatically. For explicitly controlled recovery, use the helper's explicit `restore --id ... --path ...`
 action. It fetches a fresh current revision and asks
 `restore_legacy_mirror_adoption` to restore the original content, embedding,
 fingerprint, and metadata with a compare-and-swap update. Keep the before-image
@@ -173,9 +173,9 @@ To verify optimistic concurrency:
 ## Expected Outcome
 
 - A new Edge Function at `https://<project>.supabase.co/functions/v1/update-thought-mcp`.
-- A custom connector registered in your AI client that exposes `update_thought`, `inspect_mirror_thought`, `sync_mirror_thought`, `adopt_legacy_mirror_thought`, and `restore_legacy_mirror_adoption`.
+- A custom connector registered in your AI client that exposes `update_thought`, `lookup_mirror_source`, `inspect_mirror_thought`, `sync_mirror_thought`, `adopt_legacy_mirror_thought`, and `restore_legacy_mirror_adoption`.
 - Updating an existing thought replaces its content, re-embeds it, or merges a metadata patch.
-- When `if_unchanged_since` is passed, the server rejects writes that would overwrite a concurrent change with a `STALE_READ` error, giving the caller a clear signal to re-fetch and retry.
+- Every generic update rejects changes made after its initial read, including adoption on a previously source-less row. Supplying `if_unchanged_since` additionally rejects changes made since the caller’s read. Stale writes fail with a `STALE_READ` error, giving the caller a clear signal to re-fetch and retry.
 
 The [MCP Tool Audit & Optimization Guide](../../docs/05-tool-audit.md) covers how to manage your tool surface area once you add this (and any other) custom connector.
 
@@ -188,7 +188,7 @@ Solution: Make sure the `?key=` parameter in your connector URL matches the `MCP
 Solution: This appears only when a caller passes `content`. Set the secret (`supabase secrets set OPENROUTER_API_KEY=...`) and re-deploy. Updates that only pass `metadata_patch` work without an embedding provider.
 
 **Issue: Updates always succeed even though I expected `STALE_READ`**
-Solution: `if_unchanged_since` is optional. Confirm you are actually passing it, and that the timestamp you read was the thought's `updated_at` (not `created_at`). The default `update_updated_at` trigger from the getting-started guide keeps `updated_at` current on every write.
+Solution: Every write has an internal revision guard. To also check a prior caller read, pass `if_unchanged_since` and confirm that the timestamp you read was the thought's `updated_at` (not `created_at`). The default `update_updated_at` trigger from the getting-started guide keeps `updated_at` current on every write.
 
 ## Attribution
 

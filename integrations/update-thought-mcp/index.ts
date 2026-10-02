@@ -16,8 +16,8 @@
  *     Keys not present in the patch are left alone.
  *   - `if_unchanged_since` — optional ISO 8601 timestamp (with offset). When
  *     provided, the update is rejected with a STALE_READ error if the stored
- *     `updated_at` has advanced past that reference. Omit for last-write-wins
- *     behavior (backward compatible).
+ *     `updated_at` has advanced past that reference. Every write also compares
+ *     against the row revision captured by its initial read.
  *
  * Auth: x-brain-key header OR ?key=... URL query parameter (same pattern as
  * the core server — see server/index.ts).
@@ -179,7 +179,7 @@ server.registerTool(
         .datetime({ offset: true })
         .optional()
         .describe(
-          "Optional ISO 8601 timestamp (with timezone). When provided, the update is rejected with STALE_READ if the stored updated_at has advanced past this reference. Pass the updated_at value from your most recent read to guard against lost-update conflicts. Omit to keep last-write-wins behavior.",
+          "Optional ISO 8601 timestamp (with timezone). When provided, the update is rejected with STALE_READ if the stored updated_at has advanced past this reference. Every write also compares the revision fetched internally, so concurrent changes during this call are always rejected.",
         ),
     },
   },
@@ -330,16 +330,14 @@ server.registerTool(
         };
       }
 
-      let updateQuery = supabase
+      if (typeof existing.updated_at !== "string" || !existing.updated_at) {
+        throw new Error("Thought has no updated_at concurrency token");
+      }
+      const updateQuery = supabase
         .from("thoughts")
         .update(updates)
-        .eq("id", id);
-      if (existingClaimsIdentity || sourcePath !== null) {
-        if (typeof existing.updated_at !== "string" || !existing.updated_at) {
-          throw new Error("Mapped source row has no updated_at concurrency token");
-        }
-        updateQuery = updateQuery.eq("updated_at", existing.updated_at);
-      }
+        .eq("id", id)
+        .eq("updated_at", existing.updated_at);
       const { data, error } = await updateQuery
         .select("id, content, metadata, created_at, updated_at")
         .maybeSingle();
@@ -376,6 +374,22 @@ server.registerTool(
         ],
         isError: true,
       };
+    }
+  },
+);
+
+server.registerTool(
+  "lookup_mirror_source",
+  {
+    title: "Look Up Canonical Mirror Source",
+    description: "Read and classify marker and metadata claims for one canonical path without modifying any thought. Only EXACT_ONE_VALID identifies a unique active mapping.",
+    inputSchema: { canonical_source_path: z.string().min(1).max(256) },
+  },
+  async ({ canonical_source_path }) => {
+    try {
+      return toolJson(await lookupMirrorSource(canonical_source_path));
+    } catch (err: unknown) {
+      return toolError(`lookup_mirror_source failed: ${(err as Error).message}`);
     }
   },
 );
