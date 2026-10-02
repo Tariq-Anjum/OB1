@@ -307,7 +307,7 @@ test("adoption approval is server-selected and binds UUID, path, commit, content
     sourcePath,
   );
   assert.ok(approved);
-  assert.equal(approved.canonicalCommit, "650f3bc3d8b5585ded41e5556450c97303c91481");
+  assert.equal(approved.canonicalCommit, "9b855bd8bac870b8c600d5f054a83ac61e5abdd0");
   assert.equal(approved.canonicalContentSha256, "3c073f2e75c7f26250a29cb3c48e99a948e1f894fac5199f2627090e9be7a829");
   assert.equal(approved.canonicalLegacySha256, "79dcc3bc6686cd0da5fde566509dfb21da6940918febd91a5c7bb34183e1b1b3");
   assert.deepEqual(approved.canonicalOwnerPaths, [sourcePath]);
