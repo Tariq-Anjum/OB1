@@ -11,7 +11,8 @@ CREATE TABLE IF NOT EXISTS public.thoughts (
   embedding vector(1536),
   metadata JSONB DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ DEFAULT now(),
-  updated_at TIMESTAMPTZ DEFAULT now()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    CHECK (isfinite(updated_at))
 );
 
 CREATE INDEX IF NOT EXISTS thoughts_embedding_hnsw_idx
@@ -24,6 +25,7 @@ CREATE INDEX IF NOT EXISTS thoughts_metadata_gin_idx
 CREATE INDEX IF NOT EXISTS thoughts_created_at_desc_idx
   ON public.thoughts (created_at DESC);
 
+-- Revision tokens must be finite so every successful UPDATE can advance them.
 CREATE OR REPLACE FUNCTION public.update_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN

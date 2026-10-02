@@ -72,7 +72,8 @@ create table thoughts (
   embedding vector(1536),
   metadata jsonb default '{}'::jsonb,
   created_at timestamptz default now(),
-  updated_at timestamptz default now()
+  updated_at timestamptz not null default now()
+    check (isfinite(updated_at))
 );
 
 -- Index for fast vector similarity search
@@ -86,6 +87,7 @@ create index on thoughts using gin (metadata);
 create index on thoughts (created_at desc);
 
 -- Give every UPDATE a new exact revision, even within one transaction
+-- Keep updated_at finite so each timestamp can serve as a revision token.
 create or replace function update_updated_at()
 returns trigger as $$
 begin

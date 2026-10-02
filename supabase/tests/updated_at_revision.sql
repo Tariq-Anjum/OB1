@@ -7,6 +7,7 @@ DECLARE
   v2 timestamptz;
   v3 timestamptz;
   v4 timestamptz;
+  v5 timestamptz;
   v_offset_text text;
   v_offset_token timestamptz;
   changed_rows bigint;
@@ -16,15 +17,44 @@ BEGIN
   CREATE TEMP TABLE phase2_updated_at_probe (
     id integer PRIMARY KEY,
     content text NOT NULL,
-    updated_at timestamptz NOT NULL
+    updated_at timestamptz NOT NULL,
+    CONSTRAINT phase2_updated_at_finite_check
+      CHECK (updated_at IS NOT NULL AND isfinite(updated_at))
   );
   EXECUTE 'CREATE TRIGGER phase2_updated_at_probe_trigger '
        || 'BEFORE UPDATE ON pg_temp.phase2_updated_at_probe '
        || 'FOR EACH ROW EXECUTE FUNCTION update_updated_at()';
 
+  -- Neither infinity sentinel may enter the finite revision domain.
+  BEGIN
+    INSERT INTO pg_temp.phase2_updated_at_probe(id, content, updated_at)
+    VALUES (90, 'positive infinity', 'infinity');
+    RAISE EXCEPTION 'positive infinity unexpectedly passed finite revision check';
+  EXCEPTION WHEN check_violation THEN
+    NULL;
+  END;
+  BEGIN
+    INSERT INTO pg_temp.phase2_updated_at_probe(id, content, updated_at)
+    VALUES (91, 'negative infinity', '-infinity');
+    RAISE EXCEPTION 'negative infinity unexpectedly passed finite revision check';
+  EXCEPTION WHEN check_violation THEN
+    NULL;
+  END;
+
   INSERT INTO pg_temp.phase2_updated_at_probe(id, content, updated_at)
   VALUES (1, 'same content', '2026-10-01T14:32:35.856751+00:00');
   SELECT updated_at INTO v0 FROM pg_temp.phase2_updated_at_probe WHERE id = 1;
+
+  -- The BEFORE trigger must override an attempted non-finite revision with a
+  -- finite, strictly newer value; the row cannot enter an infinite state.
+  UPDATE pg_temp.phase2_updated_at_probe
+     SET updated_at = 'infinity'
+   WHERE id = 1
+   RETURNING updated_at INTO v5;
+  IF NOT isfinite(v5) OR NOT (v5 > v0) THEN
+    RAISE EXCEPTION 'attempted infinity update did not produce a finite newer revision: v0=%, v5=%', v0, v5;
+  END IF;
+  v0 := v5;
 
   -- Identical content still creates a new revision.
   UPDATE pg_temp.phase2_updated_at_probe
