@@ -6,7 +6,7 @@ let resume;
 const output = value => process.stdout.write(JSON.stringify(value) + "\n");
 async function command(request) {
   switch (request.action) {
-    case "setup": state.row = request.row; return { ready: true };
+    case "setup": state.rows = request.rows ?? [request.row]; return { ready: true };
     case "pause":
       state.remoteGate = new Promise(resolve => { resume = resolve; });
       state.readCompleted = () => output({ event: "paused" });
@@ -19,7 +19,7 @@ async function command(request) {
       if (method.startsWith("notifications/")) return null;
       return { result: await handlers.get(params.name)(params.arguments) };
     }
-    case "inspect": return { row: state.row, attempts: state.attempts, writes: state.writes };
+    case "inspect": return { row: state.row, rows: state.rows, attempts: state.attempts, writes: state.writes };
     default: throw new Error("unknown fixture command");
   }
 }

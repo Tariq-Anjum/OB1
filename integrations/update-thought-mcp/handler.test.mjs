@@ -72,6 +72,25 @@ test("source lookup handler independently reads mapping without writing", async 
   assert.deepEqual(state.row, before);
 });
 
+test("identical mapped confirmation advances revision and invalidates outstanding fence", async () => {
+  resetRow();
+  await adopt();
+  const original = copy(state.row);
+  const request = { canonical_source_path: path, content: original.content, expected_legacy_content: legacy, expected_id: original.id, expected_updated_at: original.updated_at };
+  const confirmation = await handlers.get("sync_mirror_thought")(request);
+  assert.notEqual(confirmation.isError, true, confirmation.content[0].text);
+  assert.notEqual(state.row.updated_at, original.updated_at);
+  assert.equal(state.row.id, original.id);
+  assert.equal(state.row.content, original.content);
+  assert.deepEqual(state.row.metadata, original.metadata);
+  const confirmed = copy(state.row);
+  const stale = await handlers.get("sync_mirror_thought")({ ...request, content: content + "\nold generation" });
+  assert.equal(stale.isError, true);
+  assert.match(stale.content[0].text, /STALE_WRITE_CONFLICT/);
+  assert.deepEqual(state.row, confirmed);
+  assert.equal(state.rows.length, 1);
+});
+
 for (const stage of ["before source lookup", "before final database update"]) {
   test(`detached R1 request retains pre-dispatch fence ${stage} after R2 confirmation`, async () => {
     resetRow();

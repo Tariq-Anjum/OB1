@@ -4,8 +4,14 @@ import { registerHooks } from "node:module";
 // Load the actual TypeScript entrypoint; replace only external SDK/runtime/DB
 // boundaries. Node's native TypeScript loader executes every registered handler.
 const handlers = new Map();
-const state = { row: null, pauseNextRead: false, remoteGate: null, pauseNextUpdate: false, writes: 0, attempts: [] };
+const state = { rows: [], pauseNextRead: false, remoteGate: null, pauseNextUpdate: false, writes: 0, attempts: [] };
+Object.defineProperty(state, "row", {
+  get() { return this.rows[0] ?? null; },
+  set(value) { this.rows = value ? [value] : []; },
+});
 const copy = (value) => structuredClone(value);
+// Model the unconditional BEFORE UPDATE trigger, including identical values.
+const nextRevision = () => new Date(Date.UTC(2026, 9, 2, 2) + ++state.writes).toISOString();
 class Query {
   filters = [];
   updates = null;
@@ -19,16 +25,17 @@ class Query {
   insert(payload) { this.insertion = payload; return this; }
   execute() {
     if (this.insertion) {
-      state.row = { ...copy(this.insertion), id: "11111111-1111-4111-8111-111111111111", created_at: "2026-10-02T00:00:00Z", updated_at: `2026-10-02T02:00:0${++state.writes}+00:00` };
-      return [copy(state.row)];
+      const row = { ...copy(this.insertion), id: state.rows.length ? "22222222-2222-4222-8222-222222222222" : "11111111-1111-4111-8111-111111111111", created_at: "2026-10-02T00:00:00Z", updated_at: nextRevision() };
+      state.rows.push(row);
+      return [copy(row)];
     }
     if (this.updates) state.attempts.push(this.expectedRevision);
-    if (!state.row || !this.filters.every(filter => filter(state.row))) return [];
-    if (this.updates) state.row = { ...state.row, ...copy(this.updates), updated_at: `2026-10-02T02:00:0${++state.writes}+00:00` };
-    return [copy(state.row)];
+    const matched = state.rows.filter(row => this.filters.every(filter => filter(row)));
+    if (this.updates) for (const row of matched) Object.assign(row, copy(this.updates), { updated_at: nextRevision() });
+    return copy(matched);
   }
   async single() {
-    if (this.insertion && state.row) return { data: null, error: { code: "23505", message: "fixture canonical path uniqueness" } };
+    if (this.insertion && state.rows.some(row => row.metadata?.canonical_source_path === this.insertion.metadata?.canonical_source_path)) return { data: null, error: { code: "23505", message: "fixture canonical path uniqueness" } };
     const snapshot = this.execute()[0] ?? null;
     if (state.pauseNextRead) {
       state.pauseNextRead = false;

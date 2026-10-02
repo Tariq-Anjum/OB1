@@ -39,6 +39,15 @@ response leaves completion uncertain: inspect the unique mapping and intended
 content without mutation, or explicitly form a new current-state operation.
 The helper does not automatically resend with a newer revision.
 
+Watcher checkpoint advancement confirms the complete committed canonical
+inventory, including unchanged and reverted entries. Mapped confirmations must
+perform the request-fenced UPDATE even for identical content. The existing
+unconditional `thoughts_updated_at` BEFORE UPDATE trigger in
+`docs/01-getting-started.md` assigns a new transaction timestamp; the client
+requires independent readback to show a changed revision before completion.
+An unchanged revision fails completion. Deployment preflight must independently
+verify the live trigger; no new schema or auth boundary is introduced here.
+
 Active my-ai-brain rows carry both
 `[my-ai-brain:<canonical-relative-path>]` at the start of `content` and
 `metadata.source = "my-ai-brain"`,
