@@ -41,6 +41,7 @@ import {
   buildAdoptionRestoration,
   buildAtomicMirrorInsert,
   findApprovedLegacyAdoption,
+  isExcludedMirror,
   lookupMirrorSourceRows,
   planMirrorSync,
   sourceMarkerPath,
@@ -290,6 +291,14 @@ server.registerTool(
           ...existingMetadata,
           ...(metadata_patch ?? {}),
         };
+        if (existingClaimsIdentity && (
+          merged.source !== "my-ai-brain" ||
+          merged.canonical_source_path !== existingMetadataPath ||
+          merged.mirror_status !== "active" ||
+          isExcludedMirror(merged)
+        )) {
+          throw new Error("Generic metadata update would invalidate the active my-ai-brain source mapping");
+        }
         updates.metadata = merged;
       }
 

@@ -138,6 +138,42 @@ test("generic caller retains the existing optional Zod offset datetime input con
   const source = await readFile(new URL("./index.ts", import.meta.url), "utf8");
   assert.match(source, /if_unchanged_since: z\s*\.string\(\)\s*\.datetime\(\{ offset: true \}\)\s*\.optional\(\)/);
 });
+
+for (const field of ["lifecycle_status", "record_status", "status"]) {
+  for (const value of ["historical_superseded", "accidental_duplicate"]) {
+    test(`generic mapped metadata rejects ${field}=${value} without changing active ownership`, async () => {
+      resetRow();
+      await adopt();
+      const before = copy(state.row);
+      const writes = state.writes;
+      const result = await handlers.get("update_thought")({
+        id: approval.id,
+        metadata_patch: { [field]: value },
+        if_unchanged_since: before.updated_at,
+      });
+      assert.equal(result.isError, true, "generic patch invalidated an active canonical mapping");
+      assert.deepEqual(state.row, before, "rejected patch changed row bytes or revision");
+      assert.equal(state.rows.length, 1);
+      assert.equal(state.writes, writes);
+      const mapping = await lookupMirrorSourceRows(database, path, 1000);
+      assert.equal(mapping.status, "EXACT_ONE_VALID");
+      assert.equal(mapping.row.id, approval.id);
+    });
+  }
+}
+
+test("generic mapped metadata still accepts unrelated fields", async () => {
+  resetRow();
+  await adopt();
+  const result = await handlers.get("update_thought")({
+    id: approval.id,
+    metadata_patch: { operator_note: "kept active" },
+    if_unchanged_since: state.row.updated_at,
+  });
+  assert.notEqual(result.isError, true, result.content[0].text);
+  assert.equal(state.row.metadata.operator_note, "kept active");
+  assert.equal((await lookupMirrorSourceRows(database, path, 1000)).status, "EXACT_ONE_VALID");
+});
 test("source lookup handler independently reads mapping without writing", async () => {
   resetRow();
   await adopt();
