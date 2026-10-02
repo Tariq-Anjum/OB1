@@ -26,9 +26,18 @@ memory mirror:
 - `lookup_mirror_source(canonical_source_path)` reads both marker and metadata claims and returns their existing fail-closed classification without writing.
 - `inspect_mirror_thought(id)` reads one row and its current `updated_at` token.
 - `inspect_mirror_thought(id, include_rollback_image=true)` returns the full row preimage, including its embedding, for a one-time adoption rollback file.
-- `sync_mirror_thought(canonical_source_path, content, expected_legacy_content)` updates the one row whose leading marker and JSONB metadata agree, or inserts a new row with both identities in the same insert. It never adopts an unmarked legacy row automatically.
+- `sync_mirror_thought(canonical_source_path, content, expected_legacy_content, expected_id?, expected_updated_at?)` binds updates to the UUID and exact revision returned by the client's preceding `lookup_mirror_source`. Both fence fields are required together for updates; the server never substitutes its newer lookup revision. Omitting both means **create-only**: a source that is now mapped fails closed. Inserts still establish both identities atomically and unique violations never retry as updates. It never adopts an unmarked legacy row automatically.
 - `adopt_legacy_mirror_thought(...)` is an explicit same-UUID update for a source-less row after checking the requested path, content/fingerprint evidence, unique canonical owner, matching canonical/legacy render evidence, and current timestamp. It never creates or deletes a thought.
 - `restore_legacy_mirror_adoption(...)` restores a saved complete before-image to the same UUID only while the adopted mapping is still uniquely active and the supplied `updated_at` token is current.
+
+A mapped sync uses `UPDATE ... WHERE id = expected_id AND updated_at =
+expected_updated_at`. A detached request retains these pre-dispatch values after
+client timeout; later source lookup may validate identity but cannot refresh the
+write fence. Zero affected rows returns `STALE_WRITE_CONFLICT`, with no retry.
+An update request cannot fall back to creating a replacement UUID. A lost
+response leaves completion uncertain: inspect the unique mapping and intended
+content without mutation, or explicitly form a new current-state operation.
+The helper does not automatically resend with a newer revision.
 
 Active my-ai-brain rows carry both
 `[my-ai-brain:<canonical-relative-path>]` at the start of `content` and

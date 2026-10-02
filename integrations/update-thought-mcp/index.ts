@@ -471,11 +471,20 @@ server.registerTool(
       canonical_source_path: z.string().min(1).max(256),
       content: z.string().min(1).max(50_000),
       expected_legacy_content: z.string().min(1).max(50_000),
+      expected_id: z.string().uuid().optional().describe("Mapped UUID from source preflight; paired with expected_updated_at. Both absent means create-only."),
+      expected_updated_at: z.string().datetime({ offset: true }).optional().describe("Immutable row revision from client preflight. Required for updates; never refreshed by the server."),
     },
   },
-  async ({ canonical_source_path, content, expected_legacy_content }) => {
+  async ({ canonical_source_path, content, expected_legacy_content, expected_id, expected_updated_at }) => {
     try {
       validateCanonicalSourcePath(canonical_source_path);
+      const updateRequested = expected_id !== undefined || expected_updated_at !== undefined;
+      if (updateRequested && (
+        typeof expected_id !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(expected_id)
+        || typeof expected_updated_at !== "string" || !expected_updated_at || !Number.isFinite(Date.parse(expected_updated_at))
+      )) {
+        throw new Error("INVALID_SYNC_FENCE: update requires the preflight UUID and revision");
+      }
       if (sourceMarkerPath(content) !== canonical_source_path) {
         throw new Error("content marker does not match canonical_source_path");
       }
@@ -496,6 +505,14 @@ server.registerTool(
       if (plan.kind === "blocked") {
         throw new Error(`${plan.reason}: no row was changed`);
       }
+      // This lookup validates identity/metadata only. It cannot refresh the
+      // request's pre-dispatch fence, nor convert create-only into an update.
+      if (plan.kind === "update" && (!updateRequested || plan.id !== expected_id)) {
+        throw new Error("STALE_WRITE_CONFLICT: mapped source does not match the request fence");
+      }
+      if (plan.kind === "create" && updateRequested) {
+        throw new Error("STALE_WRITE_CONFLICT: the expected mapped source no longer exists");
+      }
 
       const [embedding, fingerprint] = await Promise.all([
         getEmbedding(content),
@@ -513,17 +530,14 @@ server.registerTool(
       });
 
       if (plan.kind === "update") {
-        if (typeof plan.expectedUpdatedAt !== "string" || !plan.expectedUpdatedAt) {
-          throw new Error("mapped row has no updated_at concurrency token");
-        }
         const { data, error } = await supabase.from("thoughts")
           .update(payload)
-          .eq("id", plan.id)
-          .eq("updated_at", plan.expectedUpdatedAt)
+          .eq("id", expected_id)
+          .eq("updated_at", expected_updated_at)
           .select(MIRROR_ROW_FIELDS)
           .maybeSingle();
         if (error) throw new Error(`source-aware update failed: ${error.message}`);
-        if (!data) throw new Error("STALE_READ: mapped mirror changed during update");
+        if (!data) throw new Error("STALE_WRITE_CONFLICT: mapped mirror no longer has the request's preflight revision");
         return toolJson({ id: data.id, operation: "updated", canonical_source_path });
       }
 
