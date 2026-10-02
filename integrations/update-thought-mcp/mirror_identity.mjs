@@ -125,7 +125,7 @@ export const LEGACY_ADOPTION_APPROVALS = Object.freeze([
   Object.freeze({
     id: "b5b70849-80cd-4388-a3bc-b09ca8ded2a8",
     sourcePath: "entries/projects/zhoor-reviewer-auth-containment.md",
-    canonicalCommit: "602809e33d8e53a95d90627481529066ce349a05",
+    canonicalCommit: "042fdf6a3e179ff201928d870f0ce00ce8356ce2",
     canonicalContentSha256: "3c073f2e75c7f26250a29cb3c48e99a948e1f894fac5199f2627090e9be7a829",
     canonicalLegacySha256: "79dcc3bc6686cd0da5fde566509dfb21da6940918febd91a5c7bb34183e1b1b3",
     canonicalOwnerPaths: Object.freeze(["entries/projects/zhoor-reviewer-auth-containment.md"]),
