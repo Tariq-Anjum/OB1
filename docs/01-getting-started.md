@@ -85,11 +85,14 @@ create index on thoughts using gin (metadata);
 -- Index for date range queries
 create index on thoughts (created_at desc);
 
--- Auto-update the updated_at timestamp
+-- Give every UPDATE a new exact revision, even within one transaction
 create or replace function update_updated_at()
 returns trigger as $$
 begin
-  new.updated_at = now();
+  new.updated_at := greatest(
+    clock_timestamp(),
+    old.updated_at + interval '1 microsecond'
+  );
   return new;
 end;
 $$ language plpgsql;

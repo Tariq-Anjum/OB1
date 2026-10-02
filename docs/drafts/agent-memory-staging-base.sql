@@ -27,7 +27,10 @@ CREATE INDEX IF NOT EXISTS thoughts_created_at_desc_idx
 CREATE OR REPLACE FUNCTION public.update_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN
-  NEW.updated_at = now();
+  NEW.updated_at := GREATEST(
+    clock_timestamp(),
+    OLD.updated_at + interval '1 microsecond'
+  );
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
