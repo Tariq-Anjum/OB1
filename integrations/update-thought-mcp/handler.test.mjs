@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { LEGACY_ADOPTION_APPROVALS, lookupMirrorSourceRows } from "./mirror_identity.mjs";
 import { handlers, state, database } from "./handler_fixture.mjs";
 const copy = value => structuredClone(value);
@@ -18,6 +19,7 @@ function resetRow() {
   state.pauseNextUpdate = false;
   state.writes = 0;
   state.attempts = [];
+  state.timestampAliases.clear();
 }
 async function adopt() {
   const result = await handlers.get("adopt_legacy_mirror_thought")({ id: approval.id, canonical_source_path: path, content, expected_updated_at: state.row.updated_at, expected_legacy_content: legacy, expected_legacy_fingerprint: fingerprint, canonical_owner_paths: [path], canonical_commit: approval.canonicalCommit, canonical_inventory_sha256: approval.canonicalInventorySha256 });
@@ -58,6 +60,83 @@ test("ordinary non-racing generic handler still updates the same UUID", async ()
   assert.equal(state.row.id, approval.id);
   assert.equal(state.row.content, "ordinary replacement");
   assert.equal(state.row.metadata.type, "observation");
+});
+
+const callerRevision = "2026-10-01T14:32:35.856751+00:00";
+const newerMicrosecondRevision = "2026-10-01T14:32:35.856999+00:00";
+test("generic stale caller microseconds cannot be replaced by the handler's newer revision", async () => {
+  resetRow();
+  await adopt();
+  state.row.updated_at = newerMicrosecondRevision;
+  state.row.content = content + "\nwriter B";
+  const before = copy(state.row);
+  const writes = state.writes;
+  state.attempts = [];
+  const result = await handlers.get("update_thought")({ id: approval.id, content: content + "\nstale caller A", if_unchanged_since: callerRevision });
+  assert.equal(result.isError, true, "distinct PostgreSQL microseconds collapsed and stale caller overwrote B");
+  assert.match(result.content[0].text, /STALE_READ/);
+  assert.deepEqual(state.row, before);
+  assert.equal(state.rows.length, 1);
+  assert.equal(state.writes, writes);
+  assert.deepEqual(state.attempts, [callerRevision], "caller fence refreshed or retry occurred");
+  const mapping = await lookupMirrorSourceRows(database, path, 1000);
+  assert.equal(mapping.status, "EXACT_ONE_VALID");
+  assert.equal(mapping.row.id, approval.id);
+});
+test("generic exact-current microsecond caller token permits same-UUID update", async () => {
+  resetRow();
+  const result = await handlers.get("update_thought")({ id: approval.id, content: "valid exact caller", if_unchanged_since: callerRevision });
+  assert.notEqual(result.isError, true, result.content[0].text);
+  assert.equal(state.row.content, "valid exact caller");
+  assert.equal(state.row.id, approval.id);
+  assert.deepEqual(state.attempts, [callerRevision]);
+});
+test("generic caller fence also rejects a write after the handler's initial read", async () => {
+  resetRow();
+  let resume;
+  const read = new Promise(resolve => { state.readCompleted = resolve; });
+  state.resumeRead = new Promise(resolve => { resume = resolve; });
+  state.pauseNextRead = true;
+  const pending = handlers.get("update_thought")({ id: approval.id, content: "stale A", if_unchanged_since: callerRevision });
+  await read;
+  let confirmed;
+  try {
+    const writer = await handlers.get("update_thought")({ id: approval.id, content: "writer B", if_unchanged_since: callerRevision });
+    assert.notEqual(writer.isError, true, writer.content[0].text);
+    confirmed = copy(state.row);
+  } finally { resume(); }
+  const result = await pending;
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /STALE_READ/);
+  assert.deepEqual(state.row, confirmed);
+  assert.equal(state.rows.length, 1);
+  assert.deepEqual(state.attempts, [callerRevision, callerRevision]);
+});
+test("generic future caller token is not an exact current database revision", async () => {
+  resetRow();
+  const before = copy(state.row);
+  const result = await handlers.get("update_thought")({ id: approval.id, content: "future-token overwrite", if_unchanged_since: newerMicrosecondRevision });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /STALE_READ/);
+  assert.deepEqual(state.row, before);
+  assert.deepEqual(state.attempts, [newerMicrosecondRevision]);
+});
+test("generic caller offset representation is passed unchanged to the database predicate", async () => {
+  resetRow();
+  const offsetRevision = "2026-10-01T16:32:35.856751+02:00";
+  // Golden equivalence independently verified by read-only PostgreSQL SELECT.
+  // The fake DB models this pair only, not a JavaScript timestamp normalizer.
+  state.timestampAliases.set(offsetRevision, callerRevision);
+  const result = await handlers.get("update_thought")({ id: approval.id, content: "equivalent offset caller", if_unchanged_since: offsetRevision });
+  assert.notEqual(result.isError, true, result.content[0].text);
+  assert.equal(state.row.content, "equivalent offset caller");
+  assert.deepEqual(state.attempts, [offsetRevision]);
+});
+test("generic caller retains the existing optional Zod offset datetime input contract", async () => {
+  // Direct handler fixtures bypass the external SDK. Assert the actual SDK
+  // schema is unchanged; the separately blocked SDK smoke is not simulated.
+  const source = await readFile(new URL("./index.ts", import.meta.url), "utf8");
+  assert.match(source, /if_unchanged_since: z\s*\.string\(\)\s*\.datetime\(\{ offset: true \}\)\s*\.optional\(\)/);
 });
 test("source lookup handler independently reads mapping without writing", async () => {
   resetRow();

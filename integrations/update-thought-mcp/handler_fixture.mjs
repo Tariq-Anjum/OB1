@@ -4,7 +4,7 @@ import { registerHooks } from "node:module";
 // Load the actual TypeScript entrypoint; replace only external SDK/runtime/DB
 // boundaries. Node's native TypeScript loader executes every registered handler.
 const handlers = new Map();
-const state = { rows: [], pauseNextRead: false, remoteGate: null, pauseNextUpdate: false, writes: 0, attempts: [] };
+const state = { rows: [], pauseNextRead: false, remoteGate: null, pauseNextUpdate: false, writes: 0, attempts: [], timestampAliases: new Map() };
 Object.defineProperty(state, "row", {
   get() { return this.rows[0] ?? null; },
   set(value) { this.rows = value ? [value] : []; },
@@ -17,7 +17,14 @@ class Query {
   updates = null;
   insertion = null;
   select() { return this; }
-  eq(key, value) { if (key === "updated_at") this.expectedRevision = value; this.filters.push(row => row[key] === value); return this; }
+  eq(key, value) {
+    if (key === "updated_at") this.expectedRevision = value;
+    // Optional golden PostgreSQL equivalent representations supplied by tests.
+    // No timestamp arithmetic or precision reduction; production uses Postgres.
+    const dbValue = value => state.timestampAliases.get(value) ?? value;
+    this.filters.push(row => key === "updated_at" ? dbValue(row[key]) === dbValue(value) : row[key] === value);
+    return this;
+  }
   like(key, pattern) { this.filters.push(row => row[key].startsWith(pattern.slice(0, -1))); return this; }
   contains(key, values) { this.filters.push(row => Object.entries(values).every(([k, v]) => row[key]?.[k] === v)); return this; }
   limit() { return this; }

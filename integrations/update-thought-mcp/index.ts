@@ -15,9 +15,9 @@
  *   - `metadata_patch` — shallow-merged into the existing metadata JSONB.
  *     Keys not present in the patch are left alone.
  *   - `if_unchanged_since` — optional ISO 8601 timestamp (with offset). When
- *     provided, the update is rejected with a STALE_READ error if the stored
- *     `updated_at` has advanced past that reference. Every write also compares
- *     against the row revision captured by its initial read.
+ *     provided, it is the exact database `updated_at` revision required for
+ *     the atomic update (including microseconds). Otherwise the revision
+ *     captured by the handler's initial read is required.
  *
  * Auth: x-brain-key header OR ?key=... URL query parameter (same pattern as
  * the core server — see server/index.ts).
@@ -179,7 +179,7 @@ server.registerTool(
         .datetime({ offset: true })
         .optional()
         .describe(
-          "Optional ISO 8601 timestamp (with timezone). When provided, the update is rejected with STALE_READ if the stored updated_at has advanced past this reference. Every write also compares the revision fetched internally, so concurrent changes during this call are always rejected.",
+          "Optional exact updated_at revision from your last read (ISO 8601 with timezone, preserving all fractional digits). The database atomically compares this caller revision; a mismatch returns STALE_READ. When omitted, the handler's initial-read revision is required instead. Both forms reject concurrent changes during this call.",
         ),
     },
   },
@@ -261,32 +261,6 @@ server.registerTool(
         }
       }
 
-      // Optimistic concurrency check. Reject if stored updated_at is strictly
-      // newer than the caller's reference timestamp.
-      if (if_unchanged_since) {
-        const storedMs = new Date(
-          (existing.updated_at as string) ?? (existing.created_at as string),
-        ).getTime();
-        const clientMs = new Date(if_unchanged_since).getTime();
-        if (
-          Number.isFinite(storedMs) &&
-          Number.isFinite(clientMs) &&
-          storedMs > clientMs
-        ) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text:
-                  `STALE_READ: thought has been modified since ${if_unchanged_since}. ` +
-                  `Current updated_at: ${existing.updated_at}. Re-fetch and retry.`,
-              },
-            ],
-            isError: true,
-          };
-        }
-      }
-
       const updates: Record<string, unknown> = {};
 
       if (content !== undefined) {
@@ -333,11 +307,15 @@ server.registerTool(
       if (typeof existing.updated_at !== "string" || !existing.updated_at) {
         throw new Error("Thought has no updated_at concurrency token");
       }
+      // Keep a caller's earlier revision immutable. PostgreSQL compares the
+      // timestamptz value exactly; JavaScript Date would discard microseconds.
+      // This same fence covers changes both before and after the handler read.
+      const expectedRevision = if_unchanged_since ?? existing.updated_at;
       const updateQuery = supabase
         .from("thoughts")
         .update(updates)
         .eq("id", id)
-        .eq("updated_at", existing.updated_at);
+        .eq("updated_at", expectedRevision);
       const { data, error } = await updateQuery
         .select("id, content, metadata, created_at, updated_at")
         .maybeSingle();

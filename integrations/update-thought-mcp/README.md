@@ -14,7 +14,7 @@ The tool supports three arguments:
 
 - `content` — when provided, overwrites the thought's text and regenerates its embedding via OpenRouter.
 - `metadata_patch` — shallow-merged into the existing `metadata` JSONB. Keys not present in the patch are left alone.
-- `if_unchanged_since` — optional ISO 8601 timestamp. When supplied, the update is rejected with `STALE_READ` if the stored `updated_at` has advanced past that reference. Every update also compares against the revision fetched by the handler, even when this argument is omitted.
+- `if_unchanged_since` — optional exact `updated_at` revision from the caller's last read, as ISO 8601 with a timezone and all fractional digits preserved. PostgreSQL compares it atomically as a `timestamptz`; any revision mismatch returns `STALE_READ`. Without this argument, the update requires the revision fetched by the handler. Either fence protects against changes after the handler's read; the caller token additionally protects the earlier caller-read window. Equivalent timezone representations follow PostgreSQL timestamp semantics.
 
 Why it matters: once more than one agent writes to the same Open Brain (Claude Desktop, Codex, a background worker, etc.), last-write-wins silently drops concurrent edits. The handler always rejects changes made after its initial read. Pass the `updated_at` you read to additionally reject changes made before the handler begins.
 
